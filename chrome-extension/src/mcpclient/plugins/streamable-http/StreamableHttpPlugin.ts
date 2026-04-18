@@ -2,6 +2,7 @@ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { ITransportPlugin, PluginMetadata, PluginConfig } from '../../types/plugin.js';
+import type { StreamableHttpPluginConfig } from '../../types/config.js';
 import { createLogger } from '@extension/shared/lib/logger';
 
 
@@ -17,10 +18,18 @@ export class StreamableHttpPlugin implements ITransportPlugin {
   };
 
   private transport: Transport | null = null;
+  private config: StreamableHttpPluginConfig = {};
 
   async initialize(config: PluginConfig): Promise<void> {
-    // Configuration can be used for future enhancements
-    logger.debug(`Initialized with config:`, config);
+    this.config = {
+      keepAlive: true,
+      connectionTimeout: 5000,
+      readTimeout: 30000,
+      fallbackToSSE: false,
+      maxRetries: 2,
+      ...config,
+    } as StreamableHttpPluginConfig;
+    logger.debug(`Initialized with config:`, this.config);
   }
 
   async connect(uri: string): Promise<Transport> {
@@ -44,7 +53,10 @@ export class StreamableHttpPlugin implements ITransportPlugin {
       logger.debug(`Creating Streamable HTTP transport for: ${url.toString()}`);
 
       // Create streamable HTTP transport
-      const transport = new StreamableHTTPClientTransport(url);
+      const transport = new StreamableHTTPClientTransport(url, {
+        authProvider: this.config.authProvider,
+        requestInit: this.config.headers ? { headers: this.config.headers } : undefined,
+      });
 
       // Return the transport without testing
       // The main client will handle the connection test
@@ -60,12 +72,21 @@ export class StreamableHttpPlugin implements ITransportPlugin {
       } else if (errorMessage.includes('timeout')) {
         enhancedError = 'Streamable HTTP connection timeout. The server may be slow or unreachable.';
       } else if (errorMessage.includes('Failed to fetch')) {
-        enhancedError = 'Streamable HTTP connection failed. Check if the server is running and accessible.';
+        console.log('[MCP StreamableHTTP] Failed to fetch while creating transport', {
+          uri,
+          error: errorMessage,
+          hint: 'Check CORS, endpoint path, HTTPS->HTTP mixed content, and server reachability.',
+        });
+        enhancedError =
+          'Streamable HTTP connection failed (Failed to fetch). Check server availability, endpoint path, CORS, and mixed-content (https page -> http server).';
       } else if (errorMessage.includes('protocol')) {
         enhancedError = 'Streamable HTTP protocol error. The server may not support streamable HTTP.';
       }
-
-      throw new Error(`StreamableHttpPlugin: ${enhancedError}`);
+      logger.error('[StreamableHttpPlugin] createConnection failed', {
+        uri,
+        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      });
+      throw new Error(`StreamableHttpPlugin [${uri}]: ${enhancedError}`);
     }
   }
 

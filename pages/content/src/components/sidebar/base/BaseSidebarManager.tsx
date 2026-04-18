@@ -386,7 +386,8 @@ export abstract class BaseSidebarManager {
         this.shadowHost.style.right = '0';
         this.shadowHost.style.zIndex = '9999';
         this.shadowHost.style.height = '100vh';
-        this.shadowHost.style.pointerEvents = 'none'; // Allow clicks 'through' the host
+        // Keep host interactive so wheel/scroll events reliably reach the sidebar in Shadow DOM.
+        this.shadowHost.style.pointerEvents = 'auto';
         this.shadowHost.style.display = 'none'; // Initialize as hidden
         // Add specific attributes for Shadow DOM targeting
         this.shadowHost.setAttribute('data-shadow-host', 'true');

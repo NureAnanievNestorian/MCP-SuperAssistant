@@ -10,12 +10,22 @@ export interface GlobalSettings {
 
 export type ConnectionType = 'sse' | 'websocket' | 'streamable-http';
 
+export interface OAuthConfig {
+  enabled: boolean;
+  clientId?: string;
+  clientSecret?: string;
+  scope?: string;
+  clientName?: string;
+  clientMetadataUrl?: string;
+}
+
 export interface ServerConfig {
   uri: string;
   connectionType: ConnectionType;
   timeout: number;
   retryAttempts: number;
   retryDelay: number;
+  oauth?: OAuthConfig;
 }
 
 export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting' | 'error' | 'reconnecting';

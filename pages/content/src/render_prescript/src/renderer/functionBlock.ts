@@ -1089,18 +1089,13 @@ const AutoExecutionUtils = {
           let currentBlock = document.querySelector<HTMLDivElement>(`.function-block[data-block-id="${blockId}"]`);
 
           if (!currentBlock) {
-            logger.debug(`Auto-execute: Original block ${blockId} not found. Searching for replacement...`);
             currentBlock = AutoExecutionUtils.findReplacementBlock(functionDetails);
           }
 
           if (!currentBlock) {
-            logger.debug(
-              `Auto-execute: Block ${blockId} not found (attempt ${attempts}/${MAX_AUTO_EXECUTE_ATTEMPTS})`,
-            );
             if (attempts < MAX_AUTO_EXECUTE_ATTEMPTS) {
               setupAutoExecution();
             } else {
-              logger.debug(`Auto-execute: Giving up on block ${blockId} - not found in DOM`);
               executionTracker.cleanupBlock(blockId);
             }
             return;
@@ -1112,27 +1107,23 @@ const AutoExecutionUtils = {
             functionDetails.contentSignature,
           );
           if (finalCheckExecuted) {
-            logger.debug(`Auto-execute: Function already executed, skipping.`);
             executionTracker.cleanupBlock(blockId);
             return;
           }
 
           const executeButton = currentBlock.querySelector<HTMLButtonElement>('.execute-button');
           if (executeButton) {
-            logger.debug(`Auto-execute: Executing function ${functionDetails.functionName}`);
             executeButton.click();
             executionTracker.cleanupBlock(blockId);
           } else {
-            logger.debug(`Auto-execute: Execute button not found (attempt ${attempts}/${MAX_AUTO_EXECUTE_ATTEMPTS})`);
             if (attempts < MAX_AUTO_EXECUTE_ATTEMPTS) {
               setupAutoExecution();
             } else {
-              logger.debug(`Auto-execute: Giving up on block ${blockId} - button not found`);
               executionTracker.cleanupBlock(blockId);
             }
           }
         },
-        autoExecuteDelay + 500, // Add base delay to the configured delay
+        autoExecuteDelay + 500,
       );
     };
 
@@ -1142,23 +1133,12 @@ const AutoExecutionUtils = {
   findReplacementBlock: (functionDetails: any): HTMLDivElement | null => {
     const potentialBlocks = document.querySelectorAll<HTMLDivElement>('.function-block');
     for (const block of potentialBlocks) {
-      const preElement = block.querySelector('pre');
-      if (!preElement?.textContent) continue;
-
-      const match = REGEX_CACHE.invokeMatch.exec(preElement.textContent);
-      REGEX_CACHE.invokeMatch.lastIndex = 0;
-
-      if (match && match[1] === functionDetails.functionName && match[2] === functionDetails.callId) {
-        const alreadyExecuted = getPreviousExecution(
-          functionDetails.functionName,
-          functionDetails.callId,
-          functionDetails.contentSignature,
-        );
-
-        if (!alreadyExecuted) {
-          logger.debug(`Auto-execute: Found replacement block, attempting execution.`);
-          return block;
-        }
+      if (
+        block.getAttribute('data-function-name') === functionDetails.functionName &&
+        block.getAttribute('data-call-id') === functionDetails.callId &&
+        block.querySelector<HTMLButtonElement>('.execute-button')
+      ) {
+        return block;
       }
     }
     return null;
@@ -1286,6 +1266,8 @@ export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { cur
   if (isNewRender) {
     blockDiv.className = 'function-block';
     blockDiv.setAttribute('data-block-id', blockId);
+    blockDiv.setAttribute('data-function-name', functionName);
+    blockDiv.setAttribute('data-call-id', callId);
     applyThemeClass(blockDiv);
     renderedFunctionBlocks.set(blockId, blockDiv);
     
@@ -1503,7 +1485,7 @@ export const renderFunctionCall = (block: HTMLPreElement, isProcessingRef: { cur
           completeParameters = extractFunctionParameters(rawContent);
         }
       }
-      addExecuteButton(buttonContainer!, rawContent);
+      addExecuteButton(buttonContainer!, rawContent, functionName);
 
       // Setup auto-execution
       const automationState = getAutomationState();

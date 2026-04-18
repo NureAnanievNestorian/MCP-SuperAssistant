@@ -40,3 +40,13 @@ export interface PrimitivesResponse {
   prompts: any[];
   timestamp: number;
 }
+
+export interface ServerSessionInfo {
+  capabilities?: any;
+  serverInfo?: any;
+  instructions?: string;
+}
+
+export interface PrimitivesSnapshot extends PrimitivesResponse {
+  session: ServerSessionInfo;
+}

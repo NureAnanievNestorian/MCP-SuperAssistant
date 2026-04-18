@@ -43,7 +43,9 @@ export type {
 export type { 
   Primitive, 
   NormalizedTool, 
+  PrimitivesSnapshot,
   PrimitivesResponse, 
+  ServerSessionInfo,
   ToolCallRequest, 
   ToolCallResult 
 } from './types/primitives.js';
@@ -165,66 +167,142 @@ export async function callToolWithBackwardsCompatibility(
   toolName: string,
   args: { [key: string]: unknown },
   adapterName?: string,
-  transportType?: import('./types/plugin.js').TransportType
+  transportType?: import('./types/plugin.js').TransportType,
+  connectionConfig?: import('./types/plugin.js').PluginConfig,
 ): Promise<any> {
-  const client = await getGlobalClient();
   const type = transportType || detectTransportType(uri);
 
-  if (!client.isConnected()) {
-    await client.connect({ uri, type });
-  }
+  try {
+    const client = await getGlobalClient();
 
-  return await client.callTool(toolName, args, adapterName);
+    if (!client.isConnected()) {
+      await client.connect({ uri, type, config: connectionConfig });
+    }
+
+    return await client.callTool(toolName, args, adapterName);
+  } catch (error) {
+    logger.error('[Backward Compatibility] callTool failed', {
+      uri,
+      transportType: type,
+      toolName,
+      adapterName: adapterName || 'unknown',
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    });
+    throw error;
+  }
 }
 
 export async function getPrimitivesWithBackwardsCompatibility(
   uri: string,
   forceRefresh: boolean = false,
-  transportType?: import('./types/plugin.js').TransportType
+  transportType?: import('./types/plugin.js').TransportType,
+  connectionConfig?: import('./types/plugin.js').PluginConfig,
 ): Promise<any[]> {
-  const client = await getGlobalClient();
   const type = transportType || detectTransportType(uri);
-  
-  if (!client.isConnected()) {
-    await client.connect({ uri, type });
+
+  try {
+    const client = await getGlobalClient();
+
+    if (!client.isConnected()) {
+      await client.connect({ uri, type, config: connectionConfig });
+    }
+
+    const response = await client.getPrimitives(forceRefresh);
+
+    // Convert back to old format
+    const primitives: any[] = [];
+
+    response.tools.forEach(tool => {
+      primitives.push({ type: 'tool', value: tool });
+    });
+
+    response.resources.forEach(resource => {
+      primitives.push({ type: 'resource', value: resource });
+    });
+
+    response.prompts.forEach(prompt => {
+      primitives.push({ type: 'prompt', value: prompt });
+    });
+
+    return primitives;
+  } catch (error) {
+    logger.error('[Backward Compatibility] getPrimitives failed', {
+      uri,
+      transportType: type,
+      forceRefresh,
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    });
+    throw error;
   }
-  
-  const response = await client.getPrimitives(forceRefresh);
-  
-  // Convert back to old format
-  const primitives: any[] = [];
-  
-  response.tools.forEach(tool => {
-    primitives.push({ type: 'tool', value: tool });
-  });
-  
-  response.resources.forEach(resource => {
-    primitives.push({ type: 'resource', value: resource });
-  });
-  
-  response.prompts.forEach(prompt => {
-    primitives.push({ type: 'prompt', value: prompt });
-  });
-  
-  return primitives;
 }
 
-export async function forceReconnectToMcpServer(uri: string, transportType?: import('./types/plugin.js').TransportType): Promise<void> {
-  const client = await getGlobalClient();
+export async function getPrimitivesSnapshotWithBackwardsCompatibility(
+  uri: string,
+  forceRefresh: boolean = false,
+  transportType?: import('./types/plugin.js').TransportType,
+  connectionConfig?: import('./types/plugin.js').PluginConfig,
+): Promise<import('./types/primitives.js').PrimitivesSnapshot> {
   const type = transportType || detectTransportType(uri);
-  
-  if (client.isConnected()) {
-    await client.disconnect();
+
+  try {
+    const client = await getGlobalClient();
+
+    if (!client.isConnected()) {
+      await client.connect({ uri, type, config: connectionConfig });
+    }
+
+    const response = await client.getPrimitives(forceRefresh);
+    const session = client.getServerSessionInfo();
+
+    return {
+      ...response,
+      session,
+    };
+  } catch (error) {
+    logger.error('[Backward Compatibility] getPrimitivesSnapshot failed', {
+      uri,
+      transportType: type,
+      forceRefresh,
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    });
+    throw error;
   }
-  
-  await client.connect({ uri, type });
 }
 
-export async function runWithBackwardsCompatibility(uri: string, transportType?: import('./types/plugin.js').TransportType): Promise<void> {
+export async function forceReconnectToMcpServer(
+  uri: string,
+  transportType?: import('./types/plugin.js').TransportType,
+  connectionConfig?: import('./types/plugin.js').PluginConfig,
+): Promise<void> {
+  const type = transportType || detectTransportType(uri);
+
+  try {
+    const client = await getGlobalClient();
+
+    if (client.isConnected()) {
+      await client.disconnect();
+    }
+
+    await client.connect({ uri, type, config: connectionConfig });
+  } catch (error) {
+    logger.error('[Backward Compatibility] forceReconnect failed', {
+      uri,
+      transportType: type,
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    });
+    throw error;
+  }
+}
+
+export async function runWithBackwardsCompatibility(
+  uri: string,
+  transportType?: import('./types/plugin.js').TransportType,
+  connectionConfig?: import('./types/plugin.js').PluginConfig,
+): Promise<void> {
   const client = await getGlobalClient();
   const type = transportType || detectTransportType(uri);
   
-  await client.connect({ uri, type });
+  await client.connect({ uri, type, config: connectionConfig });
   
   const response = await client.getPrimitives();
   logger.debug(`Connected, found ${response.tools.length} tools, ${response.resources.length} resources, ${response.prompts.length} prompts`);

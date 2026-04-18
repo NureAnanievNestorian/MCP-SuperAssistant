@@ -110,8 +110,11 @@ export class WebSocketPlugin implements ITransportPlugin {
       } else if (errorMessage.includes('protocol')) {
         enhancedError = 'WebSocket protocol error. The server may not support the requested protocols.';
       }
-
-      throw new Error(`WebSocket Plugin: ${enhancedError}`);
+      logger.error('[WebSocketPlugin] createConnection failed', {
+        uri,
+        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      });
+      throw new Error(`WebSocket Plugin [${uri}]: ${enhancedError}`);
     }
   }
 

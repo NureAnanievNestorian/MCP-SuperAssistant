@@ -231,6 +231,35 @@ export const useMcpCommunication = () => {
     }
   }, [isInitialized, config, setConfig]);
 
+  const getOAuthStatus = useCallback(async () => {
+    if (!isInitialized) {
+      throw new Error('Communication layer not initialized');
+    }
+    return await mcpClient.getOAuthStatus();
+  }, [isInitialized]);
+
+  const startOAuthFlow = useCallback(async () => {
+    if (!isInitialized) {
+      throw new Error('Communication layer not initialized');
+    }
+    return await mcpClient.startOAuthFlow();
+  }, [isInitialized]);
+
+  const clearOAuthCredentials = useCallback(async () => {
+    if (!isInitialized) {
+      throw new Error('Communication layer not initialized');
+    }
+    return await mcpClient.clearOAuthCredentials();
+  }, [isInitialized]);
+
+  const getPrimitivesSnapshot = useCallback(async (forceRefresh = false) => {
+    if (!isInitialized) {
+      throw new Error('Communication layer not initialized');
+    }
+
+    return await mcpClient.getPrimitivesSnapshot(forceRefresh);
+  }, [isInitialized]);
+
   /* ---------------------------------------------------------------------- */
   /* Legacy compatibility layer                                             */
   /* ---------------------------------------------------------------------- */
@@ -363,6 +392,10 @@ export const useMcpCommunication = () => {
     }, [isInitialized]),
     getServerConfig,
     updateServerConfig,
+    getOAuthStatus,
+    startOAuthFlow,
+    clearOAuthCredentials,
+    getPrimitivesSnapshot,
 
     /* -------------------------------------------------------------------- */
     /* Legacy compatibility                                                 */

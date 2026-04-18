@@ -18,8 +18,19 @@ export const generateInstructionsJson = (
   tools: Array<{ name: string; schema: string; description: string }>,
   customInstructions?: string,
   customInstructionsEnabled?: boolean,
+  serverContext?: {
+    serverInstructions?: string;
+    resources?: Array<{ name?: string; uri?: string; description?: string }>;
+    prompts?: Array<{ name?: string; description?: string }>;
+    serverInfo?: { name?: string; title?: string; version?: string; description?: string };
+  },
 ): string => {
-  if (!tools || tools.length === 0) {
+  const hasServerContext =
+    Boolean(serverContext?.serverInstructions?.trim()) ||
+    Boolean(serverContext?.resources?.length) ||
+    Boolean(serverContext?.prompts?.length);
+
+  if ((!tools || tools.length === 0) && !hasServerContext) {
     return '# No tools available\n\nConnect to the MCP server to see available tools.';
   }
 
@@ -292,6 +303,43 @@ ClassName | Custom class | User
       // instructions += '}\n</use_mcp_tool>\n```\n\n';
     }
   });
+
+  if (!tools.length) {
+    instructions += '- No tools were advertised by this server in the current session.\n\n';
+  }
+
+  const trimmedServerInstructions = serverContext?.serverInstructions?.trim();
+  if (trimmedServerInstructions) {
+    instructions += '\n## MCP SERVER INSTRUCTIONS (FROM INITIALIZE)\n\n';
+    if (serverContext?.serverInfo?.name || serverContext?.serverInfo?.version || serverContext?.serverInfo?.title) {
+      const serverLabel = serverContext.serverInfo?.title || serverContext.serverInfo?.name || 'Unknown server';
+      const serverVersion = serverContext.serverInfo?.version ? ` v${serverContext.serverInfo.version}` : '';
+      instructions += `Source: ${serverLabel}${serverVersion}\n\n`;
+    }
+    instructions += `${trimmedServerInstructions}\n\n`;
+  }
+
+  const resources = Array.isArray(serverContext?.resources) ? serverContext.resources : [];
+  if (resources.length > 0) {
+    instructions += '\n## MCP RESOURCES DISCOVERED\n\n';
+    resources.slice(0, 50).forEach(resource => {
+      const resourceName = resource?.name || resource?.uri || 'Unnamed resource';
+      const resourceUri = resource?.uri ? ` (${resource.uri})` : '';
+      instructions += `- ${resourceName}${resourceUri}\n`;
+    });
+    instructions += '\n';
+  }
+
+  const prompts = Array.isArray(serverContext?.prompts) ? serverContext.prompts : [];
+  if (prompts.length > 0) {
+    instructions += '\n## MCP PROMPTS DISCOVERED\n\n';
+    prompts.slice(0, 50).forEach(prompt => {
+      const promptName = prompt?.name || 'Unnamed prompt';
+      const promptDescription = prompt?.description ? `: ${prompt.description}` : '';
+      instructions += `- ${promptName}${promptDescription}\n`;
+    });
+    instructions += '\n';
+  }
 
   // instructions += 'Print it exactly, there is a capturing tool which needs prinited text to run the tool manually\n\n';
 

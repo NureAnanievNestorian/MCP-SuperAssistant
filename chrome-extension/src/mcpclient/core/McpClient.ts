@@ -1,6 +1,8 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
+import type { jsonSchemaValidator, JsonSchemaValidatorResult } from '@modelcontextprotocol/sdk/validation/types.js';
 
 import { EventEmitter } from './EventEmitter.js';
 import { PluginRegistry } from './PluginRegistry.js';
@@ -10,7 +12,7 @@ import { StreamableHttpPlugin } from '../plugins/streamable-http/StreamableHttpP
 import type { ClientConfig, ConnectionRequest } from '../types/config.js';
 import { DEFAULT_CLIENT_CONFIG } from '../types/config.js';
 import type { TransportType, ITransportPlugin, PluginConfig } from '../types/plugin.js';
-import type { Primitive, NormalizedTool, PrimitivesResponse } from '../types/primitives.js';
+import type { Primitive, NormalizedTool, PrimitivesResponse, ServerSessionInfo } from '../types/primitives.js';
 import type { AllEvents } from '../types/events.js';
 import { createLogger } from '@extension/shared/lib/logger';
 import { analyticsService } from '../../../utils/analytics-service.js';
@@ -18,12 +20,31 @@ import { analyticsService } from '../../../utils/analytics-service.js';
 
 const logger = createLogger('McpClient');
 
+/**
+ * CSP-safe JSON schema validator for MV3 environments.
+ *
+ * The MCP SDK defaults to AJV which relies on runtime code generation
+ * (`new Function`) and is blocked by extension CSP. We intentionally
+ * provide a permissive validator here to avoid crashing `tools/list`
+ * when servers include `outputSchema`.
+ */
+class CspSafeJsonSchemaValidator implements jsonSchemaValidator {
+  getValidator<T>(_schema: unknown): (input: unknown) => JsonSchemaValidatorResult<T> {
+    return (input: unknown): JsonSchemaValidatorResult<T> => ({
+      valid: true,
+      data: input as T,
+      errorMessage: undefined,
+    });
+  }
+}
+
 export class McpClient extends EventEmitter<AllEvents> {
   private registry: PluginRegistry;
   private config: ClientConfig;
   private client: Client | null = null;
   private activePlugin: ITransportPlugin | null = null;
   private activeTransport: Transport | null = null;
+  private activeConnectionConfig: PluginConfig | null = null;
   private isConnectedFlag: boolean = false;
   private connectionPromise: Promise<void> | null = null;
   private healthCheckTimer: NodeJS.Timeout | null = null;
@@ -186,7 +207,13 @@ export class McpClient extends EventEmitter<AllEvents> {
           name: `mcp-client-${type}`,
           version: '1.0.0',
         },
-        { capabilities: {} },
+        {
+          capabilities: {},
+          // MV3 service workers block eval/new Function.
+          // Use a CSP-safe validator to avoid AJV codegen crashes
+          // when servers expose tool outputSchema.
+          jsonSchemaValidator: new CspSafeJsonSchemaValidator(),
+        },
       );
 
       // Set up logging notification handler
@@ -206,12 +233,22 @@ export class McpClient extends EventEmitter<AllEvents> {
         }, connectionTimeout);
       });
 
-      await Promise.race([connectionPromise, timeoutPromise]);
+      try {
+        await Promise.race([connectionPromise, timeoutPromise]);
+      } catch (error) {
+        if (this.isUnauthorizedError(error) && await this.tryInteractiveAuth(transport as any, finalConfig)) {
+          logger.debug('[McpClient] OAuth flow completed, retrying MCP client connection...');
+          await Promise.race([this.client.connect(transport), timeoutPromise]);
+        } else {
+          throw error;
+        }
+      }
       logger.debug(`MCP client connected successfully`);
 
       // Store connection state
       this.activePlugin = plugin;
       this.activeTransport = transport;
+      this.activeConnectionConfig = finalConfig;
       this.isConnectedFlag = true;
 
       // Clear cache on new connection
@@ -324,8 +361,52 @@ export class McpClient extends EventEmitter<AllEvents> {
     }
 
     this.activeTransport = null;
+    this.activeConnectionConfig = null;
     this.isConnectedFlag = false;
     this.clearPrimitivesCache();
+  }
+
+  private isUnauthorizedError(error: unknown): boolean {
+    if (error instanceof UnauthorizedError) return true;
+    if (!(error instanceof Error)) return false;
+    return error.name === 'UnauthorizedError' || /unauthorized/i.test(error.message);
+  }
+
+  private async tryInteractiveAuth(transport: any, config: PluginConfig): Promise<boolean> {
+    const authProvider = (config as any)?.authProvider;
+    const finishAuth = typeof transport?.finishAuth === 'function' ? transport.finishAuth.bind(transport) : null;
+    const waitForAuthorizationCode =
+      authProvider && typeof authProvider.waitForAuthorizationCode === 'function'
+        ? authProvider.waitForAuthorizationCode.bind(authProvider)
+        : null;
+    const isAuthorizing =
+      authProvider && typeof authProvider.isAuthorizing === 'function'
+        ? authProvider.isAuthorizing.bind(authProvider)
+        : null;
+
+    if (!finishAuth || !waitForAuthorizationCode) {
+      return false;
+    }
+
+    // Guard against calling finishAuth when OAuth flow did not actually start
+    // (e.g., discovery/CORS failure before redirect is initiated).
+    if (isAuthorizing && !isAuthorizing()) {
+      logger.debug('[McpClient] Skipping interactive OAuth completion: authorization flow is not active.');
+      return false;
+    }
+
+    try {
+      const authorizationCode = await waitForAuthorizationCode();
+      await finishAuth(authorizationCode);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/authorization has not been started/i.test(message)) {
+        logger.debug('[McpClient] OAuth completion skipped: authorization was not started.');
+        return false;
+      }
+      throw error;
+    }
   }
 
   async callTool(toolName: string, args: Record<string, any>, adapterName?: string): Promise<any> {
@@ -513,6 +594,18 @@ export class McpClient extends EventEmitter<AllEvents> {
       type: this.activePlugin?.metadata.transportType || null,
       uri: null, // Could store this if needed
       pluginInfo: this.activePlugin?.metadata || null,
+    };
+  }
+
+  getServerSessionInfo(): ServerSessionInfo {
+    if (!this.client) {
+      return {};
+    }
+
+    return {
+      capabilities: this.client.getServerCapabilities(),
+      serverInfo: this.client.getServerVersion(),
+      instructions: this.client.getInstructions(),
     };
   }
 

@@ -119,7 +119,8 @@ class McpClient {
             connectionType: 'sse',
             timeout: 5000,
             retryAttempts: 3,
-            retryDelay: 2000
+            retryDelay: 2000,
+            oauth: { enabled: true },
           });
         }
 
@@ -500,6 +501,48 @@ class McpClient {
   }
 
   /**
+   * Retrieve full primitives snapshot (tools/resources/prompts + initialize metadata).
+   */
+  async getPrimitivesSnapshot(forceRefresh = false): Promise<{
+    tools: any[];
+    resources: any[];
+    prompts: any[];
+    session: {
+      capabilities?: any;
+      serverInfo?: any;
+      instructions?: string;
+    };
+    timestamp: number;
+  }> {
+    if (!this.isInitialized) {
+      throw new Error('McpClient not initialized');
+    }
+
+    logMessage(`[McpClient] Getting primitives snapshot (forceRefresh: ${forceRefresh})`);
+
+    try {
+      const snapshot = await contextBridge.sendMessage(
+        'background',
+        'mcp:get-primitives',
+        { forceRefresh },
+        { timeout: 15_000 },
+      );
+
+      return {
+        tools: Array.isArray(snapshot?.tools) ? snapshot.tools : [],
+        resources: Array.isArray(snapshot?.resources) ? snapshot.resources : [],
+        prompts: Array.isArray(snapshot?.prompts) ? snapshot.prompts : [],
+        session: snapshot?.session || {},
+        timestamp: typeof snapshot?.timestamp === 'number' ? snapshot.timestamp : Date.now(),
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logMessage(`[McpClient] Failed to get primitives snapshot: ${errorMessage}`);
+      throw error;
+    }
+  }
+
+  /**
    * Force a reconnect to the MCP SSE endpoint with enhanced state management
    */
   async forceReconnect(): Promise<boolean> {
@@ -676,6 +719,61 @@ class McpClient {
       logMessage(`[McpClient] Failed to update server config: ${errorMessage}`);
       throw error;
     }
+  }
+
+  async getOAuthStatus(): Promise<{ enabled: boolean; hasTokens: boolean; isAuthorizing: boolean; error?: string }> {
+    if (!this.isInitialized) {
+      throw new Error('McpClient not initialized');
+    }
+
+    const response = await contextBridge.sendMessage(
+      'background',
+      'mcp:get-oauth-status',
+      {},
+      { timeout: 5_000 },
+    );
+
+    return {
+      enabled: !!response?.enabled,
+      hasTokens: !!response?.hasTokens,
+      isAuthorizing: !!response?.isAuthorizing,
+      error: typeof response?.error === 'string' ? response.error : undefined,
+    };
+  }
+
+  async startOAuthFlow(): Promise<{ success: boolean; hasTokens: boolean; message?: string; error?: string }> {
+    if (!this.isInitialized) {
+      throw new Error('McpClient not initialized');
+    }
+
+    const response = await contextBridge.sendMessage(
+      'background',
+      'mcp:start-oauth',
+      {},
+      { timeout: 120_000 },
+    );
+
+    return {
+      success: !!response?.success,
+      hasTokens: !!response?.hasTokens,
+      message: typeof response?.message === 'string' ? response.message : undefined,
+      error: typeof response?.error === 'string' ? response.error : undefined,
+    };
+  }
+
+  async clearOAuthCredentials(): Promise<boolean> {
+    if (!this.isInitialized) {
+      throw new Error('McpClient not initialized');
+    }
+
+    const response = await contextBridge.sendMessage(
+      'background',
+      'mcp:clear-oauth',
+      {},
+      { timeout: 10_000 },
+    );
+
+    return !!response?.success;
   }
 
   /**

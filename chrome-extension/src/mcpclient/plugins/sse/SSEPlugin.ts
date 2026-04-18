@@ -56,7 +56,10 @@ export class SSEPlugin implements ITransportPlugin {
       logger.debug(`Creating SSE transport for: ${url.toString()}`);
 
       // Create SSE transport
-      const transport = new SSEClientTransport(url);
+      const transport = new SSEClientTransport(url, {
+        authProvider: this.config.authProvider,
+        requestInit: this.config.headers ? { headers: this.config.headers } : undefined,
+      });
 
       // Return the transport without testing
       // The main client will handle the connection test
@@ -72,10 +75,19 @@ export class SSEPlugin implements ITransportPlugin {
       } else if (errorMessage.includes('timeout')) {
         enhancedError = 'SSE connection timeout. The server may be slow or the endpoint may not support SSE.';
       } else if (errorMessage.includes('Failed to fetch')) {
-        enhancedError = 'SSE connection failed. Check if the server is running and accessible.';
+        console.log('[MCP SSE] Failed to fetch while creating transport', {
+          uri,
+          error: errorMessage,
+          hint: 'Check CORS, endpoint path, HTTPS->HTTP mixed content, and server reachability.',
+        });
+        enhancedError =
+          'SSE connection failed (Failed to fetch). Check server availability, URL path, CORS, and mixed-content (https page -> http server).';
       }
-
-      throw new Error(`SSE Plugin: ${enhancedError}`);
+      logger.error('[SSEPlugin] createConnection failed', {
+        uri,
+        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      });
+      throw new Error(`SSE Plugin [${uri}]: ${enhancedError}`);
     }
   }
 

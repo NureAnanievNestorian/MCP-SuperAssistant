@@ -59,6 +59,22 @@ export interface GetToolsResponse {
   tools: Tool[];
 }
 
+export interface GetPrimitivesRequest {
+  forceRefresh?: boolean;
+}
+
+export interface GetPrimitivesResponse {
+  tools: Tool[];
+  resources: any[];
+  prompts: any[];
+  session: {
+    capabilities?: any;
+    serverInfo?: any;
+    instructions?: string;
+  };
+  timestamp: number;
+}
+
 // Force reconnect
 export interface ForceReconnectRequest {}
 
@@ -80,6 +96,31 @@ export interface UpdateServerConfigRequest {
 }
 
 export interface UpdateServerConfigResponse {
+  success: boolean;
+}
+
+// OAuth status and flow
+export interface GetOAuthStatusRequest {}
+
+export interface GetOAuthStatusResponse {
+  enabled: boolean;
+  hasTokens: boolean;
+  isAuthorizing: boolean;
+  error?: string;
+}
+
+export interface StartOAuthFlowRequest {}
+
+export interface StartOAuthFlowResponse {
+  success: boolean;
+  hasTokens: boolean;
+  message?: string;
+  error?: string;
+}
+
+export interface ClearOAuthCredentialsRequest {}
+
+export interface ClearOAuthCredentialsResponse {
   success: boolean;
 }
 
@@ -121,9 +162,13 @@ export type McpMessageType =
   | 'mcp:call-tool'
   | 'mcp:get-connection-status'
   | 'mcp:get-tools'
+  | 'mcp:get-primitives'
   | 'mcp:force-reconnect'
   | 'mcp:get-server-config'
   | 'mcp:update-server-config'
+  | 'mcp:get-oauth-status'
+  | 'mcp:start-oauth'
+  | 'mcp:clear-oauth'
   | 'mcp:heartbeat'
   | 'connection:status-changed'
   | 'mcp:tool-update'
@@ -144,6 +189,10 @@ export interface McpMessageMap {
     request: GetToolsRequest;
     response: GetToolsResponse;
   };
+  'mcp:get-primitives': {
+    request: GetPrimitivesRequest;
+    response: GetPrimitivesResponse;
+  };
   'mcp:force-reconnect': {
     request: ForceReconnectRequest;
     response: ForceReconnectResponse;
@@ -155,6 +204,18 @@ export interface McpMessageMap {
   'mcp:update-server-config': {
     request: UpdateServerConfigRequest;
     response: UpdateServerConfigResponse;
+  };
+  'mcp:get-oauth-status': {
+    request: GetOAuthStatusRequest;
+    response: GetOAuthStatusResponse;
+  };
+  'mcp:start-oauth': {
+    request: StartOAuthFlowRequest;
+    response: StartOAuthFlowResponse;
+  };
+  'mcp:clear-oauth': {
+    request: ClearOAuthCredentialsRequest;
+    response: ClearOAuthCredentialsResponse;
   };
   'mcp:heartbeat': {
     request: HeartbeatRequest;
@@ -186,9 +247,13 @@ export function isValidMessageType(type: string): type is McpMessageType {
     'mcp:call-tool',
     'mcp:get-connection-status',
     'mcp:get-tools',
+    'mcp:get-primitives',
     'mcp:force-reconnect',
     'mcp:get-server-config',
     'mcp:update-server-config',
+    'mcp:get-oauth-status',
+    'mcp:start-oauth',
+    'mcp:clear-oauth',
     'mcp:heartbeat',
     'connection:status-changed',
     'mcp:tool-update',

@@ -66,6 +66,10 @@ export const instructionsState = {
 interface InstructionManagerProps {
   adapter: any;
   tools: Array<{ name: string; schema: string; description: string }>;
+  serverInstructions?: string;
+  serverResources?: Array<{ name?: string; uri?: string; description?: string }>;
+  serverPrompts?: Array<{ name?: string; description?: string }>;
+  serverInfo?: { name?: string; title?: string; version?: string; description?: string };
 }
 
 // Button component for consistent styling
@@ -104,7 +108,14 @@ const ActionButton: React.FC<ActionButtonProps> = ({ onClick, disabled, loading,
   );
 };
 
-const InstructionManager: React.FC<InstructionManagerProps> = ({ adapter, tools }) => {
+const InstructionManager: React.FC<InstructionManagerProps> = ({
+  adapter,
+  tools,
+  serverInstructions,
+  serverResources = [],
+  serverPrompts = [],
+  serverInfo,
+}) => {
   // Use Zustand hooks for user preferences and tool enablement
   const { preferences, updatePreferences } = useUserPreferences();
   const { enabledTools: enabledToolsSet, isToolEnabled } = useToolEnablement();
@@ -162,8 +173,18 @@ const InstructionManager: React.FC<InstructionManagerProps> = ({ adapter, tools 
     //   return generateInstructions(enabledTools, customInstructions, customInstructionsEnabled);
     // }
 
-    return generateInstructionsJson(enabledTools, customInstructions, customInstructionsEnabled);
-  }, [enabledTools, customInstructions, customInstructionsEnabled]);
+    return generateInstructionsJson(
+      enabledTools,
+      customInstructions,
+      customInstructionsEnabled,
+      {
+        serverInstructions,
+        resources: serverResources,
+        prompts: serverPrompts,
+        serverInfo,
+      },
+    );
+  }, [enabledTools, customInstructions, customInstructionsEnabled, serverInstructions, serverResources, serverPrompts, serverInfo]);
 
   // Memoize the actual current instructions to prevent unnecessary re-calculations
   const currentInstructions = useMemo(() => {

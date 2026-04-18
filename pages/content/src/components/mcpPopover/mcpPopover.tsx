@@ -6,6 +6,7 @@ import PopoverPortal from './PopoverPortal';
 import { instructionsState } from '../sidebar/Instructions/InstructionManager';
 import { AutomationService } from '../../services/automation.service';
 import { createLogger } from '@extension/shared/lib/logger';
+import { getExtensionAssetUrl } from '../../utils/extensionRuntime';
 
 
 const logger = createLogger('mcpPopover');
@@ -1132,24 +1133,29 @@ export const MCPPopover: React.FC<MCPPopoverProps> = ({ toggleStateManager, adap
   const buttonClassName = adapterButtonConfig?.className
     ? `${adapterButtonConfig.className}${state.mcpEnabled && adapterButtonConfig.activeClassName ? ` ${adapterButtonConfig.activeClassName}` : ''}`
     : `mcp-main-button${state.mcpEnabled ? '' : ' inactive'}`;
+  const iconUrl = getExtensionAssetUrl('icon-34.png');
 
   const buttonContent = adapterButtonConfig?.contentClassName ? (
     <span className={adapterButtonConfig.contentClassName}>
+      {iconUrl ? (
         <img 
-          src={chrome.runtime.getURL('icon-34.png')} 
+          src={iconUrl} 
           alt="MCP Logo" 
           className={adapterButtonConfig.iconClassName || ''}
-        style={{ width: '20px', height: '20px', borderRadius: '50%' }}
+          style={{ width: '20px', height: '20px', borderRadius: '50%' }}
         />
+      ) : null}
       <span className={adapterButtonConfig.textClassName || ''}>MCP</span>
     </span>
   ) : (
     <>
-      <img 
-        src={chrome.runtime.getURL('icon-34.png')} 
-        alt="MCP Logo" 
-        style={{ width: '20px', height: '20px', marginRight: '1px', verticalAlign: 'middle', borderRadius: '50%' }}
-      />
+      {iconUrl ? (
+        <img 
+          src={iconUrl} 
+          alt="MCP Logo" 
+          style={{ width: '20px', height: '20px', marginRight: '1px', verticalAlign: 'middle', borderRadius: '50%' }}
+        />
+      ) : null}
       MCP
     </>
   );

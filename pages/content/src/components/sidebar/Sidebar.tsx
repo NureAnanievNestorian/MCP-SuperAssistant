@@ -5,6 +5,7 @@ import { useUIStore } from '@src/stores/ui.store';
 import ServerStatus from './ServerStatus/ServerStatus';
 import AvailableTools from './AvailableTools/AvailableTools';
 import InstructionManager from './Instructions/InstructionManager';
+import McpDataPanel from './McpDataPanel';
 import InputArea from './InputArea/InputArea';
 import Settings from './Settings/Settings';
 import { useMcpCommunication } from '@src/hooks/useMcpCommunication';
@@ -15,6 +16,7 @@ import { cn } from '@src/lib/utils';
 import { Card, CardContent } from '@src/components/ui/card';
 import type { UserPreferences } from '@src/types/stores';
 import { createLogger } from '@extension/shared/lib/logger';
+import { getExtensionAssetUrl, isExtensionContextInvalidatedError } from '@src/utils/extensionRuntime';
 // Debug helper function to check if activeSidebarManager is available
 
 const logger = createLogger('Sidebar');
@@ -82,36 +84,39 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
   const [isInitializing, setIsInitializing] = useState<boolean>(true); // Track initialization state
 
   // Get communication methods with guaranteed safe fallbacks and error boundaries
+  let detectedContextInvalidation = false;
+  let detectedInitializationError: string | null = null;
   let communicationMethods;
   try {
     communicationMethods = useMcpCommunication();
   } catch (error) {
     // Handle extension context invalidation gracefully
-    if (error instanceof Error && error.message.includes('Extension context invalidated')) {
+    if (isExtensionContextInvalidatedError(error)) {
       logMessage('[Sidebar] Extension context invalidated during hook initialization');
-      // Don't set state during render - use useEffect instead
-      React.useEffect(() => {
-        setExtensionContextInvalid(true);
-        setInitializationError('Extension was reloaded. Please refresh the page to restore functionality.');
-      }, []);
+      detectedContextInvalidation = true;
+      detectedInitializationError = 'Extension was reloaded. Please refresh the page to restore functionality.';
       
       // Provide fallback methods
       communicationMethods = {
         availableTools: [],
         sendMessage: async () => 'Extension context invalidated',
         refreshTools: async () => [],
+        getPrimitivesSnapshot: async () => ({ tools: [], resources: [], prompts: [], session: {}, timestamp: Date.now() }),
         forceReconnect: async () => false,
         serverStatus: 'disconnected' as const,
         updateServerConfig: async () => false,
         getServerConfig: async () => ({ uri: '' })
       };
     } else {
-      logMessage(`[Sidebar] Unexpected error in useMcpCommunication: ${error instanceof Error ? error.message : String(error)}`);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logMessage(`[Sidebar] Unexpected error in useMcpCommunication: ${errorMessage}`);
+      detectedInitializationError = `Communication initialization failed: ${errorMessage}`;
       // Provide safe fallback methods for any other error
       communicationMethods = {
         availableTools: [],
         sendMessage: async () => 'Communication error',
         refreshTools: async () => [],
+        getPrimitivesSnapshot: async () => ({ tools: [], resources: [], prompts: [], session: {}, timestamp: Date.now() }),
         forceReconnect: async () => false,
         serverStatus: 'disconnected' as const,
         updateServerConfig: async () => false,
@@ -120,12 +125,66 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
     }
   }
 
+  useEffect(() => {
+    if (detectedContextInvalidation && !extensionContextInvalid) {
+      setExtensionContextInvalid(true);
+    }
+    if (detectedInitializationError && initializationError !== detectedInitializationError) {
+      setInitializationError(detectedInitializationError);
+    }
+  }, [detectedContextInvalidation, detectedInitializationError, extensionContextInvalid, initializationError]);
+
   // Always render immediately - use safe defaults for all communication methods
   const serverStatus = connectionStatus || communicationMethods?.serverStatus || 'disconnected';
   const availableTools = communicationMethods?.availableTools || [];
   const sendMessage = communicationMethods?.sendMessage || (async () => 'Communication not available');
   const refreshTools = communicationMethods?.refreshTools || (async () => []);
+  const getPrimitivesSnapshot = communicationMethods?.getPrimitivesSnapshot || (async () => ({
+    tools: [],
+    resources: [],
+    prompts: [],
+    session: {},
+    timestamp: Date.now(),
+  }));
   const forceReconnect = communicationMethods?.forceReconnect || (async () => false);
+  const [serverPrimitiveContext, setServerPrimitiveContext] = useState<{
+    resources: any[];
+    prompts: any[];
+    session: {
+      capabilities?: any;
+      serverInfo?: any;
+      instructions?: string;
+    };
+  }>({
+    resources: [],
+    prompts: [],
+    session: {},
+  });
+  const [isPrimitivesRefreshing, setIsPrimitivesRefreshing] = useState(false);
+
+  const refreshPrimitivesContext = useCallback(
+    async (forceRefresh = false) => {
+      try {
+        if (forceRefresh) {
+          setIsPrimitivesRefreshing(true);
+        }
+
+        const snapshot = await getPrimitivesSnapshot(forceRefresh);
+        setServerPrimitiveContext({
+          resources: snapshot.resources || [],
+          prompts: snapshot.prompts || [],
+          session: snapshot.session || {},
+        });
+      } catch (error) {
+        logMessage(`[Sidebar] Failed to load primitives context: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        if (forceRefresh) {
+          setIsPrimitivesRefreshing(false);
+        }
+      }
+    },
+    [getPrimitivesSnapshot],
+  );
 
   // Component mounting and stability tracking
   useEffect(() => {
@@ -154,6 +213,14 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
       logMessage(`[Sidebar] serverStatus changed to: "${serverStatus}", passing to ServerStatus component`);
     }
   }, [serverStatus, isStable]);
+
+  useEffect(() => {
+    if (!isStable || serverStatus !== 'connected') {
+      return;
+    }
+
+    void refreshPrimitivesContext(false);
+  }, [isStable, serverStatus, refreshPrimitivesContext]);
 
   // Monitor activeSidebarManager availability for debugging
   useEffect(() => {
@@ -271,7 +338,7 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
   }, [sidebarVisible, isMinimized, isPushMode, sidebarWidth]);
 
   // Local UI state that doesn't need to be in the store
-  const [activeTab, setActiveTab] = useState<'availableTools' | 'instructions' | 'settings'>('availableTools');
+  const [activeTab, setActiveTab] = useState<'availableTools' | 'instructions' | 'mcpData' | 'settings'>('availableTools');
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isTransitioning, setIsTransitioning] = useState(false);
   const [isInputMinimized, setIsInputMinimized] = useState(false);
@@ -634,6 +701,8 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
     }
   };
 
+  const iconUrl = getExtensionAssetUrl('icon-34.png');
+
   return (
     <div
       ref={sidebarRef}
@@ -669,11 +738,13 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
                 className="block">
                 {' '}
                 {/* Make link block for sizing */}
-                <img
-                  src={chrome.runtime.getURL('icon-34.png')}
-                  alt="MCP Logo"
-                  className="w-8 h-8 rounded-md " // Increase size & add rounded corners
-                />
+                {iconUrl ? (
+                  <img
+                    src={iconUrl}
+                    alt="MCP Logo"
+                    className="w-8 h-8 rounded-md " // Increase size & add rounded corners
+                  />
+                ) : null}
               </a>
               <>
                 {/* Wrap title in link */}
@@ -743,12 +814,12 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
         <div
           ref={contentRef}
           className={cn(
-            'absolute top-0 bottom-0 right-0 transition-transform duration-200 ease-in-out',
+            'absolute inset-0 overflow-y-auto overflow-x-hidden transition-transform duration-200 ease-in-out',
             isMinimized ? 'translate-x-full' : 'translate-x-0',
             isTransitioning ? 'will-change-transform' : '',
           )}
           style={{ width: `${sidebarWidth}px` }}>
-          <div className="flex flex-col h-full">
+          <div className="flex flex-col min-h-full">
             {/* Critical Error Display - Only show for severe failures, never block UI */}
             {initializationError && (
               <div className="bg-red-50 dark:bg-red-900/20 border-b border-red-200 dark:border-red-800 p-3 flex-shrink-0">
@@ -792,7 +863,7 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
             )}
 
             {/* Status and Settings section */}
-            <div className="py-4 px-4 space-y-4 overflow-y-auto flex-shrink-0">
+            <div className="py-4 px-4 space-y-4 flex-shrink-0">
               <ServerStatus status={serverStatus} />
 
               {/* Settings */}
@@ -840,35 +911,45 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
                 </CardContent>
               </Card>
 
-              {/* Tabs for Tools/Instructions */}
-              <div className="border-b border-slate-200 dark:border-slate-700 mb-2">
-                <div className="flex">
+              {/* Tabs */}
+              <div className="border-b border-slate-200 dark:border-slate-700 mb-2 pb-2">
+                <div className="grid grid-cols-2 gap-2">
                   <button
                     className={cn(
-                      'py-2 px-4 font-medium text-sm transition-all duration-200',
+                      'py-2 px-3 font-medium text-sm transition-all duration-200 rounded-md text-center',
                       activeTab === 'availableTools'
-                        ? 'border-b-2 border-indigo-600 text-indigo-600 dark:border-indigo-400 dark:text-indigo-400'
-                        : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-t-lg',
+                        ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200 dark:bg-indigo-500/10 dark:text-indigo-300 dark:ring-indigo-400/30'
+                        : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800',
                     )}
                     onClick={() => setActiveTab('availableTools')}>
                     Available Tools
                   </button>
                   <button
                     className={cn(
-                      'py-2 px-4 font-medium text-sm transition-all duration-200',
+                      'py-2 px-3 font-medium text-sm transition-all duration-200 rounded-md text-center',
                       activeTab === 'instructions'
-                        ? 'border-b-2 border-indigo-600 text-indigo-600 dark:border-indigo-400 dark:text-indigo-400'
-                        : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-t-lg',
+                        ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200 dark:bg-indigo-500/10 dark:text-indigo-300 dark:ring-indigo-400/30'
+                        : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800',
                     )}
                     onClick={() => setActiveTab('instructions')}>
                     Instructions
                   </button>
                   <button
                     className={cn(
-                      'py-2 px-4 font-medium text-sm transition-all duration-200',
+                      'py-2 px-3 font-medium text-sm transition-all duration-200 rounded-md text-center',
+                      activeTab === 'mcpData'
+                        ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200 dark:bg-indigo-500/10 dark:text-indigo-300 dark:ring-indigo-400/30'
+                        : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800',
+                    )}
+                    onClick={() => setActiveTab('mcpData')}>
+                    MCP Data
+                  </button>
+                  <button
+                    className={cn(
+                      'py-2 px-3 font-medium text-sm transition-all duration-200 rounded-md text-center',
                       activeTab === 'settings'
-                        ? 'border-b-2 border-indigo-600 text-indigo-600 dark:border-indigo-400 dark:text-indigo-400'
-                        : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-t-lg',
+                        ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200 dark:bg-indigo-500/10 dark:text-indigo-300 dark:ring-indigo-400/30'
+                        : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800',
                     )}
                     onClick={() => setActiveTab('settings')}>
                     Settings
@@ -905,7 +986,36 @@ const Sidebar: React.FC<SidebarProps> = ({ initialPreferences }) => {
                 )}>
                 <Card className="border-slate-200 dark:border-slate-700 dark:bg-slate-800 rounded-lg shadow-sm overflow-hidden hover:shadow-md transition-shadow duration-300">
                   <CardContent className="p-0">
-                    <InstructionManager adapter={adapter} tools={formattedTools} />
+                    <InstructionManager
+                      adapter={adapter}
+                      tools={formattedTools}
+                      serverInstructions={serverPrimitiveContext.session.instructions}
+                      serverResources={serverPrimitiveContext.resources}
+                      serverPrompts={serverPrimitiveContext.prompts}
+                      serverInfo={serverPrimitiveContext.session.serverInfo}
+                    />
+                  </CardContent>
+                </Card>
+              </div>
+
+              {/* MCP Data */}
+              <div
+                className={cn(
+                  'h-full overflow-y-auto scrollbar-thin scrollbar-thumb-slate-300 dark:scrollbar-thumb-slate-600 scrollbar-track-transparent',
+                  { hidden: activeTab !== 'mcpData' },
+                )}>
+                <Card className="border-slate-200 dark:border-slate-700 dark:bg-slate-800 rounded-lg shadow-sm overflow-hidden hover:shadow-md transition-shadow duration-300">
+                  <CardContent className="p-0">
+                    <McpDataPanel
+                      serverInfo={serverPrimitiveContext.session.serverInfo}
+                      serverInstructions={serverPrimitiveContext.session.instructions}
+                      resources={serverPrimitiveContext.resources}
+                      prompts={serverPrimitiveContext.prompts}
+                      onRefresh={async () => {
+                        await refreshPrimitivesContext(true);
+                      }}
+                      isRefreshing={isPrimitivesRefreshing}
+                    />
                   </CardContent>
                 </Card>
               </div>

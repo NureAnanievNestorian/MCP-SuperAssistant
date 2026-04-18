@@ -11,6 +11,142 @@ import { createLogger } from '@extension/shared/lib/logger';
 
 const logger = createLogger('AdapterAccess');
 
+// ---------------------------------------------------------------------------
+// Base64 file extraction helpers
+// ---------------------------------------------------------------------------
+
+const MIME_TO_EXT: Record<string, string> = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
+  'image/webp': 'webp', 'image/svg+xml': 'svg',
+  'application/pdf': 'pdf',
+  'text/plain': 'txt', 'text/csv': 'csv', 'text/html': 'html',
+  'application/json': 'json',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+};
+
+function mimeToExt(mimeType: string): string {
+  return MIME_TO_EXT[mimeType] ?? mimeType.split('/')[1]?.replace(/[^a-z0-9]/g, '') ?? 'bin';
+}
+
+function base64ToFile(data: string, fileName: string, mimeType: string): File {
+  const binary = atob(data.replace(/\s/g, ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new File([bytes], fileName, { type: mimeType });
+}
+
+interface ExtractedFiles {
+  text: string;
+  files: File[];
+}
+
+const BASE64_MIN_LENGTH = 200;
+
+function looksLikeBase64(s: string): boolean {
+  const clean = s.replace(/\s/g, '');
+  return clean.length >= BASE64_MIN_LENGTH && /^[A-Za-z0-9+/]+=*$/.test(clean);
+}
+
+function inferMimeFromBase64(data: string): string | null {
+  if (data.startsWith('/9j/')) return 'image/jpeg';
+  if (data.startsWith('iVBOR')) return 'image/png';
+  if (data.startsWith('R0lGO')) return 'image/gif';
+  if (data.startsWith('UklGR')) return 'image/webp';
+  if (data.startsWith('JVBER')) return 'application/pdf';
+  if (data.startsWith('PD94b') || data.startsWith('PHN2Z')) return 'image/svg+xml';
+  return null;
+}
+
+/**
+ * Scans a plain JS object for base64-encoded file fields (e.g. image_base64).
+ * Returns cleaned object text (with [file #N] placeholders) and File objects.
+ */
+function extractFilesFromObject(obj: Record<string, any>): ExtractedFiles {
+  const files: File[] = [];
+  const cleaned: Record<string, any> = {};
+
+  for (const [key, value] of Object.entries(obj)) {
+    if (typeof value === 'string' && looksLikeBase64(value)) {
+      const mimeType =
+        (typeof obj.mime_type === 'string' ? obj.mime_type : null) ??
+        (typeof obj.mimeType === 'string' ? obj.mimeType : null) ??
+        (typeof obj.image_format === 'string' ? `image/${obj.image_format}` : null) ??
+        (typeof obj.format === 'string' && obj.format !== 'json' ? `image/${obj.format}` : null) ??
+        inferMimeFromBase64(value) ??
+        'application/octet-stream';
+      const fileNum = files.length + 1;
+      files.push(base64ToFile(value, `attachment_${fileNum}.${mimeToExt(mimeType)}`, mimeType));
+      cleaned[key] = `[file #${fileNum}]`;
+    } else {
+      cleaned[key] = value;
+    }
+  }
+
+  return { text: files.length > 0 ? JSON.stringify(cleaned, null, 2) : '', files };
+}
+
+/**
+ * Post-processes rawResultText: if it's a JSON object containing base64 fields,
+ * extracts them as File objects and replaces with [file #N] placeholders.
+ */
+function tryExtractFilesFromText(text: string): ExtractedFiles {
+  if (!text || text.length < BASE64_MIN_LENGTH) return { text, files: [] };
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const extracted = extractFilesFromObject(parsed);
+      if (extracted.files.length > 0) return extracted;
+    }
+  } catch {}
+  return { text, files: [] };
+}
+
+/**
+ * Scans an MCP content array for image/resource items with base64 data.
+ * Returns modified text (with [file #N] placeholders) and File objects.
+ */
+function extractFilesFromContent(content: any[]): ExtractedFiles {
+  const files: File[] = [];
+  const textParts: string[] = [];
+
+  for (const item of content) {
+    if (item.type === 'text' && item.text) {
+      // Also try to extract base64 from text items that contain JSON
+      const inner = tryExtractFilesFromText(item.text);
+      if (inner.files.length > 0) {
+        textParts.push(inner.text);
+        files.push(...inner.files.map((f, i) =>
+          new File([f], `attachment_${files.length + i + 1}${f.name.slice(f.name.lastIndexOf('.'))}`, { type: f.type })
+        ));
+      } else {
+        textParts.push(item.text);
+      }
+    } else if (item.type === 'image' && item.data) {
+      const fileNum = files.length + 1;
+      const mimeType = item.mimeType || 'image/png';
+      files.push(base64ToFile(item.data, `attachment_${fileNum}.${mimeToExt(mimeType)}`, mimeType));
+      textParts.push(`[file #${fileNum}]`);
+    } else if (item.type === 'resource' && item.resource) {
+      const res = item.resource;
+      const blob: string | undefined = res.blob ?? res.data;
+      if (blob) {
+        const fileNum = files.length + 1;
+        const mimeType: string = res.mimeType || 'application/octet-stream';
+        const uriName = typeof res.uri === 'string' ? res.uri.split('/').pop() : undefined;
+        files.push(base64ToFile(blob, uriName || `attachment_${fileNum}.${mimeToExt(mimeType)}`, mimeType));
+        textParts.push(`[file #${fileNum}]`);
+      } else if (res.text) {
+        textParts.push(res.text);
+      }
+    }
+  }
+
+  return { text: textParts.join('\n'), files };
+}
+
 declare global {
   interface Window {
     mcpAdapter?: any;
@@ -579,7 +715,11 @@ export const smoothlyUpdateBlockContent = (
  * @param blockDiv Function block div container
  * @param rawContent Raw XML content containing the function call
  */
-export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): void => {
+export const addExecuteButton = (
+  blockDiv: HTMLDivElement,
+  rawContent: string,
+  functionNameHint?: string,
+): void => {
   // Check for existing execute button to avoid duplicates
   if (blockDiv.querySelector('.execute-button')) {
     return;
@@ -587,7 +727,7 @@ export const addExecuteButton = (blockDiv: HTMLDivElement, rawContent: string): 
 
   // Detect format and extract function name and parameters
   const isJSON = rawContent.includes('"type"') && rawContent.includes('function_call');
-  const functionName = extractFunctionName(rawContent);
+  const functionName = extractFunctionName(rawContent) || functionNameHint || null;
 
   let parameters: Record<string, any>;
   let callId: string;
@@ -1330,6 +1470,7 @@ export const displayResult = (
   if (success) {
     // Optimized success result processing
     let rawResultText = '';
+    let resultFiles: File[] = [];
 
     // Create result content efficiently
     const resultContent = createOptimizedElement('div', {
@@ -1339,43 +1480,34 @@ export const displayResult = (
     // Process result data efficiently
     if (typeof result === 'object') {
       try {
-        // Check if result has the new format with content array
         if (result && result.content && Array.isArray(result.content)) {
-          // Extract text from content array
-          const textParts = result.content
-            .filter((item: any) => item.type === 'text' && item.text)
-            .map((item: any) => item.text);
+          const extracted = extractFilesFromContent(result.content);
+          rawResultText = extracted.text;
+          resultFiles = extracted.files;
 
-          if (textParts.length > 0) {
-            rawResultText = textParts.join('\n');
+          if (rawResultText) {
             resultContent.textContent = rawResultText;
-          } else {
-            // Fallback to full JSON if no text content found
+          }
+          for (const file of resultFiles) {
+            const preview = createOptimizedElement('div', {
+              className: 'file-attachment-preview',
+              textContent: `📎 ${file.name} (${(file.size / 1024).toFixed(1)} KB)`,
+            });
+            resultContent.appendChild(preview);
+          }
+          if (!rawResultText && resultFiles.length === 0) {
             rawResultText = JSON.stringify(result, null, 2);
             const pre = createOptimizedElement('pre', {
               textContent: rawResultText,
-              styles: {
-                fontFamily: 'inherit',
-                fontSize: '13px',
-                lineHeight: '1.5',
-                padding: '0',
-                margin: '0',
-              },
+              styles: { fontFamily: 'inherit', fontSize: '13px', lineHeight: '1.5', padding: '0', margin: '0' },
             });
             resultContent.appendChild(pre);
           }
         } else {
-          // Original object handling for backward compatibility
           rawResultText = JSON.stringify(result, null, 2);
           const pre = createOptimizedElement('pre', {
             textContent: rawResultText,
-            styles: {
-              fontFamily: 'inherit',
-              fontSize: '13px',
-              lineHeight: '1.5',
-              padding: '0',
-              margin: '0',
-            },
+            styles: { fontFamily: 'inherit', fontSize: '13px', lineHeight: '1.5', padding: '0', margin: '0' },
           });
           resultContent.appendChild(pre);
         }
@@ -1386,6 +1518,23 @@ export const displayResult = (
     } else {
       rawResultText = String(result);
       resultContent.textContent = rawResultText;
+    }
+
+    // Post-process: extract base64 files from rawResultText (e.g. JSON with image_base64 fields)
+    if (resultFiles.length === 0 && rawResultText) {
+      const extracted = tryExtractFilesFromText(rawResultText);
+      if (extracted.files.length > 0) {
+        rawResultText = extracted.text;
+        resultFiles = extracted.files;
+        resultContent.textContent = rawResultText;
+        for (const file of resultFiles) {
+          const preview = createOptimizedElement('div', {
+            className: 'file-attachment-preview',
+            textContent: `📎 ${file.name} (${(file.size / 1024).toFixed(1)} KB)`,
+          });
+          resultContent.appendChild(preview);
+        }
+      }
     }
 
     // Add result to panel
@@ -1722,7 +1871,8 @@ export const displayResult = (
           new CustomEvent('mcp:tool-execution-complete', {
             detail: {
               result: wrappedResult,
-              skipAutoInsertCheck: false
+              files: resultFiles.length > 0 ? resultFiles : undefined,
+              skipAutoInsertCheck: false,
             },
           }),
         );

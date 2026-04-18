@@ -17,6 +17,22 @@ interface ServerStatusProps {
   status: string;
 }
 
+const inferConnectionTypeFromUri = (uri: string, fallback: ConnectionType): ConnectionType => {
+  try {
+    const protocol = new URL(uri).protocol;
+    if (protocol === 'ws:' || protocol === 'wss:') {
+      return 'websocket';
+    }
+    if (protocol === 'http:' || protocol === 'https:') {
+      // HTTP transport is auto-resolved by background (streamable-http <-> sse fallback).
+      return 'streamable-http';
+    }
+  } catch {
+    // Ignore invalid URI and keep fallback.
+  }
+  return fallback;
+};
+
 const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) => {
   // Use Zustand hooks for connection status and server config
   const {
@@ -34,13 +50,18 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [lastReconnectTime, setLastReconnectTime] = useState<string>('');
   const [serverUri, setServerUri] = useState<string>(serverConfig.uri || '');
-  const [connectionType, setConnectionType] = useState<ConnectionType>(serverConfig.connectionType || 'sse');
+  const [connectionType, setConnectionType] = useState<ConnectionType>(serverConfig.connectionType || 'streamable-http');
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [hasBackgroundError, setHasBackgroundError] = useState<boolean>(false);
   const [isEditingUri, setIsEditingUri] = useState<boolean>(false);
-  const [isEditingConnectionType, setIsEditingConnectionType] = useState<boolean>(false);
   const [lastErrorMessage, setLastErrorMessage] = useState<string>('');
   const [configFetched, setConfigFetched] = useState<boolean>(false);
+  const [oauthClientId, setOauthClientId] = useState<string>('');
+  const [oauthClientSecret, setOauthClientSecret] = useState<string>('');
+  const [oauthScope, setOauthScope] = useState<string>('');
+  const [oauthHasTokens, setOauthHasTokens] = useState<boolean>(false);
+  const [oauthIsAuthorizing, setOauthIsAuthorizing] = useState<boolean>(false);
+  const [oauthStatusError, setOauthStatusError] = useState<string>('');
 
   // Animation states
   const [showSuccessAnimation, setShowSuccessAnimation] = useState(false);
@@ -108,7 +129,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
   );
 
   const updateServerConfig = useCallback(
-    async (config: { uri: string; connectionType: ConnectionType }) => {
+    async (config: { uri: string; connectionType: ConnectionType; oauth?: any }) => {
       try {
         if (!communicationMethods.updateServerConfig) {
           throw new Error('Communication method unavailable');
@@ -131,12 +152,16 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
       setServerUri(serverConfig.uri);
       logMessage(`[ServerStatus] Updated server URI from config: ${serverConfig.uri}`);
     }
-    // Only update connection type from store if user is not actively editing it
-    if (serverConfig.connectionType && !isEditingConnectionType) {
+    if (serverConfig.connectionType) {
       setConnectionType(serverConfig.connectionType);
       logMessage(`[ServerStatus] Updated connection type from config: ${serverConfig.connectionType}`);
     }
-  }, [serverConfig.uri, serverConfig.connectionType, isEditingUri, isEditingConnectionType]);
+    if (serverConfig.oauth) {
+      setOauthClientId(serverConfig.oauth.clientId || '');
+      setOauthClientSecret(serverConfig.oauth.clientSecret || '');
+      setOauthScope(serverConfig.oauth.scope || '');
+    }
+  }, [serverConfig.uri, serverConfig.connectionType, serverConfig.oauth, isEditingUri]);
 
   // Force immediate connection status check on mount
   useEffect(() => {
@@ -280,6 +305,11 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
             setConnectionType(config.connectionType);
             logMessage(`[ServerStatus] Initial connection type loaded: ${config.connectionType}`);
           }
+          if (config.oauth) {
+            setOauthClientId(config.oauth.clientId || '');
+            setOauthClientSecret(config.oauth.clientSecret || '');
+            setOauthScope(config.oauth.scope || '');
+          }
           setConfigFetched(true);
         } else {
           logMessage('[ServerStatus] No valid server configuration received from background storage');
@@ -300,15 +330,14 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
       communicationMethods &&
       typeof communicationMethods.getServerConfig === 'function' &&
       !configFetched &&
-      !isEditingUri &&
-      !isEditingConnectionType
+      !isEditingUri
     ) {
       fetchInitialServerConfig().catch(() => {
         logMessage('[ServerStatus] Failed to fetch server configuration');
         setServerUri(''); // Set empty string as last resort
       });
     }
-  }, [communicationMethods, isEditingUri, isEditingConnectionType, configFetched, getServerConfig]); // Add configFetched dependency
+  }, [communicationMethods, isEditingUri, configFetched, getServerConfig]); // Add configFetched dependency
 
   // Set status message based on connection state
   useEffect(() => {
@@ -402,6 +431,12 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
       }
 
       logMessage(`[ServerStatus] Reconnection error: ${error instanceof Error ? error.message : String(error)}`);
+      console.log('[MCP Sidebar] Reconnection error', {
+        status,
+        serverUri,
+        connectionType,
+        error: error instanceof Error ? error.message : String(error),
+      });
 
       // Use the enhanced error message from the error object and store it
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -460,19 +495,51 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
   const handleServerUriBlur = () => {
     // Don't immediately clear editing flag - wait for save or cancel
   };
+  const effectiveConnectionType = inferConnectionTypeFromUri(serverUri, connectionType);
 
-  const handleConnectionTypeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    setConnectionType(e.target.value as ConnectionType);
-    setIsEditingConnectionType(true); // Mark as editing when user changes
+  const refreshOAuthStatus = useCallback(async () => {
+    try {
+      if (!communicationMethods.getOAuthStatus) return;
+      const status = await communicationMethods.getOAuthStatus();
+      setOauthHasTokens(Boolean(status.hasTokens));
+      setOauthIsAuthorizing(Boolean(status.isAuthorizing));
+      setOauthStatusError(status.error || '');
+    } catch (error) {
+      setOauthStatusError(error instanceof Error ? error.message : String(error));
+    }
+  }, [communicationMethods]);
+
+  const handleStartOAuth = async () => {
+    if (!communicationMethods.startOAuthFlow) return;
+    setOauthStatusError('');
+    setOauthIsAuthorizing(true);
+    try {
+      const result = await communicationMethods.startOAuthFlow();
+      if (!result.success) {
+        setOauthStatusError(result.error || result.message || 'OAuth authorization failed');
+      }
+      await refreshOAuthStatus();
+    } catch (error) {
+      setOauthStatusError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setOauthIsAuthorizing(false);
+    }
   };
 
-  const handleConnectionTypeFocus = () => {
-    setIsEditingConnectionType(true); // Mark as editing when user focuses the select
+  const handleClearOAuth = async () => {
+    if (!communicationMethods.clearOAuthCredentials) return;
+    try {
+      await communicationMethods.clearOAuthCredentials();
+      await refreshOAuthStatus();
+    } catch (error) {
+      setOauthStatusError(error instanceof Error ? error.message : String(error));
+    }
   };
 
-  const handleConnectionTypeBlur = () => {
-    // Don't immediately clear editing flag - wait for save or cancel
-  };
+  useEffect(() => {
+    if (!showSettings || effectiveConnectionType === 'websocket') return;
+    refreshOAuthStatus().catch(() => {});
+  }, [showSettings, effectiveConnectionType, refreshOAuthStatus]);
 
   const handleSaveServerConfig = async () => {
     if (!communicationMethods.updateServerConfig || hasBackgroundError) {
@@ -496,18 +563,26 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
     const minDisplayDuration = 1500; // Minimum 1.5 seconds to prevent jitter
 
     try {
-      logMessage(`[ServerStatus] Saving server URI: ${serverUri} with connection type: ${connectionType}`);
+      logMessage(
+        `[ServerStatus] Saving server URI: ${serverUri} with inferred connection type: ${effectiveConnectionType}`,
+      );
+      const effectiveOauthEnabled = effectiveConnectionType !== 'websocket';
+      const oauth = {
+        enabled: effectiveOauthEnabled,
+        clientId: oauthClientId.trim() || undefined,
+        clientSecret: oauthClientSecret.trim() || undefined,
+        scope: oauthScope.trim() || undefined,
+      };
 
       // Update server config using Zustand store
-      setServerConfig({ uri: serverUri, connectionType });
+      setServerConfig({ uri: serverUri, connectionType: effectiveConnectionType, oauth });
 
       // Also update via background communication for backward compatibility
-      await updateServerConfig({ uri: serverUri, connectionType });
+      await updateServerConfig({ uri: serverUri, connectionType: effectiveConnectionType, oauth });
       logMessage('[ServerStatus] Server config updated successfully');
 
       // Clear the editing flags since we successfully saved
       setIsEditingUri(false);
-      setIsEditingConnectionType(false);
 
       // Trigger reconnect
       const success = await forceReconnect();
@@ -551,6 +626,11 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
       }
 
       const errorMessage = error instanceof Error ? error.message : String(error);
+      console.log('[MCP Sidebar] Save server config failed', {
+        serverUri,
+        connectionType: effectiveConnectionType,
+        error: errorMessage,
+      });
       setLastErrorMessage(errorMessage);
       setStatusMessage(`Configuration failed: ${errorMessage}`);
       logMessage(`[ServerStatus] Save config error: ${errorMessage}`);
@@ -772,31 +852,6 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
               </Typography>
               
               <div className="mb-4">
-                <label htmlFor="connection-type" className="block mb-2 text-slate-600 dark:text-slate-400 font-medium">
-                  Connection Type
-                </label>
-                <select
-                  id="connection-type"
-                  value={connectionType}
-                  onChange={handleConnectionTypeChange}
-                  onFocus={handleConnectionTypeFocus}
-                  onBlur={handleConnectionTypeBlur}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white dark:bg-slate-800 dark:border-slate-600 dark:text-slate-200 focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-600 focus:border-transparent outline-none transition-all duration-200 hover:border-slate-400 dark:hover:border-slate-500"
-                >
-                  <option value="sse">Server-Sent Events (SSE)</option>
-                  <option value="websocket">WebSocket</option>
-                  <option value="streamable-http">Streamable HTTP</option>
-                </select>
-                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  {connectionType === 'sse' 
-                    ? 'HTTP-based streaming connection (traditional)' 
-                    : connectionType === 'websocket'
-                      ? 'Full-duplex WebSocket connection (faster, more features)'
-                      : 'Advanced HTTP streaming (modern MCP protocol)'}
-                </p>
-              </div>
-
-              <div className="mb-4">
                 <label htmlFor="server-uri" className="block mb-2 text-slate-600 dark:text-slate-400 font-medium">
                   Server URI
                 </label>
@@ -807,9 +862,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                   onChange={handleServerUriChange}
                   onFocus={handleServerUriFocus}
                   onBlur={handleServerUriBlur}
-                  placeholder={connectionType === 'sse' 
-                    ? "http://localhost:3006/sse" 
-                    : connectionType === 'websocket'
+                  placeholder={effectiveConnectionType === 'websocket'
                       ? "ws://localhost:3006/message"
                       : "http://localhost:3006/mcp"}
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white dark:bg-slate-800 dark:border-slate-600 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-600 focus:border-transparent outline-none transition-all duration-200 hover:border-slate-400 dark:hover:border-slate-500"
@@ -819,7 +872,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                     <strong>To start MCP SuperAssistant Proxy:</strong>
                   </div>
                   <div className="bg-slate-100 dark:bg-slate-800 p-2 rounded font-mono text-xs border">
-                    npx @srbhptl39/mcp-superassistant-proxy@latest --config ./config.json --outputTransport {connectionType === 'sse' ? 'sse' : connectionType === 'websocket' ? 'ws' : 'streamableHttp'}
+                    npx @srbhptl39/mcp-superassistant-proxy@latest --config ./config.json --outputTransport {effectiveConnectionType === 'websocket' ? 'ws' : 'streamableHttp'}
                   </div>
                   <div className="mt-2 text-xs">
                     <div className="mb-1">
@@ -851,12 +904,69 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                   </div>
                 </div>
               </div>
+
+              <div className="mb-4 rounded-lg border border-slate-200 dark:border-slate-700 p-3">
+                <div className="font-medium text-slate-700 dark:text-slate-200 mb-2">OAuth Authentication</div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+                  {effectiveConnectionType === 'websocket'
+                    ? 'OAuth is available only for SSE and Streamable HTTP.'
+                    : 'OAuth is auto-detected for this transport. Add optional fields below only if your provider requires them.'}
+                </p>
+
+                {effectiveConnectionType !== 'websocket' && (
+                  <div className="space-y-2">
+                    <input
+                      type="text"
+                      value={oauthClientId}
+                      onChange={e => setOauthClientId(e.target.value)}
+                      placeholder="OAuth Client ID (optional)"
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white dark:bg-slate-800 dark:border-slate-600 dark:text-slate-200"
+                    />
+                    <input
+                      type="password"
+                      value={oauthClientSecret}
+                      onChange={e => setOauthClientSecret(e.target.value)}
+                      placeholder="OAuth Client Secret (optional)"
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white dark:bg-slate-800 dark:border-slate-600 dark:text-slate-200"
+                    />
+                    <input
+                      type="text"
+                      value={oauthScope}
+                      onChange={e => setOauthScope(e.target.value)}
+                      placeholder="OAuth Scope (optional)"
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white dark:bg-slate-800 dark:border-slate-600 dark:text-slate-200"
+                    />
+                    <div className="flex items-center gap-2 pt-1">
+                      <Button
+                        onClick={handleStartOAuth}
+                        variant="outline"
+                        size="sm"
+                        disabled={oauthIsAuthorizing || isReconnecting}>
+                        {oauthIsAuthorizing ? 'Authorizing...' : 'Authorize'}
+                      </Button>
+                      <Button
+                        onClick={handleClearOAuth}
+                        variant="outline"
+                        size="sm"
+                        disabled={oauthIsAuthorizing}>
+                        Clear Token
+                      </Button>
+                      <span className={cn('text-xs', oauthHasTokens ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400')}>
+                        {oauthHasTokens ? 'Token available' : 'No token'}
+                      </span>
+                    </div>
+                    {oauthStatusError && (
+                      <p className="text-xs text-rose-600 dark:text-rose-400">{oauthStatusError}</p>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <div className="flex justify-end gap-2">
                 <Button
                   onClick={() => {
                     setShowSettings(false);
                     setIsEditingUri(false);
-                    setIsEditingConnectionType(false);
                     // Reset to stored config when canceling
                     if (serverConfig.uri) {
                       setServerUri(serverConfig.uri);
@@ -864,6 +974,9 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                     if (serverConfig.connectionType) {
                       setConnectionType(serverConfig.connectionType);
                     }
+                    setOauthClientId(serverConfig.oauth?.clientId || '');
+                    setOauthClientSecret(serverConfig.oauth?.clientSecret || '');
+                    setOauthScope(serverConfig.oauth?.scope || '');
                   }}
                   variant="outline"
                   size="sm"
@@ -936,13 +1049,13 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                   <span className="font-medium text-slate-700 dark:text-slate-200">Connection Type:</span>
                   <span className={cn(
                     'px-2 py-1 rounded-full text-xs font-medium',
-                    connectionType === 'websocket' 
+                    effectiveConnectionType === 'websocket'
                       ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/20 dark:text-blue-400'
-                      : connectionType === 'streamable-http'
+                      : effectiveConnectionType === 'streamable-http'
                         ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
                         : 'bg-gray-100 text-gray-700 dark:bg-gray-900/20 dark:text-gray-400',
                   )}>
-                    {connectionType === 'websocket' ? 'WebSocket' : connectionType === 'streamable-http' ? 'Streamable HTTP' : 'SSE'}
+                    {effectiveConnectionType === 'websocket' ? 'WebSocket' : effectiveConnectionType === 'streamable-http' ? 'Streamable HTTP' : 'SSE'}
                   </span>
                 </div>
 

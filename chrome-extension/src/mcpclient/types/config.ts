@@ -1,4 +1,5 @@
 import type { TransportType, PluginConfig } from './plugin.js';
+import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 
 export interface GlobalConfig {
   timeout: number;
@@ -13,6 +14,7 @@ export interface SSEPluginConfig extends PluginConfig {
   connectionTimeout?: number;
   readTimeout?: number;
   headers?: Record<string, string>;
+  authProvider?: OAuthClientProvider;
 }
 
 export interface WebSocketPluginConfig extends PluginConfig {
@@ -30,6 +32,7 @@ export interface StreamableHttpPluginConfig extends PluginConfig {
   headers?: Record<string, string>;
   fallbackToSSE?: boolean;
   maxRetries?: number;
+  authProvider?: OAuthClientProvider;
 }
 
 export interface ClientConfig {

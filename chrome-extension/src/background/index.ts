@@ -8,6 +8,7 @@ import {
   checkMcpServerConnection,
   callToolWithBackwardsCompatibility,
   getPrimitivesWithBackwardsCompatibility,
+  getPrimitivesSnapshotWithBackwardsCompatibility,
   resetMcpConnectionState,
   resetMcpConnectionStateForRecovery,
   normalizeToolsFromPrimitives as normalizeTools,
@@ -17,6 +18,7 @@ import {
 } from '../mcpclient/index';
 import { sendAnalyticsEvent, trackError, collectDemographicData } from '../../utils/analytics';
 import { analyticsService } from '../../utils/analytics-service';
+import { OAuthManager, type OAuthConfig } from './oauth-manager';
 
 // Import message types for type safety
 import type {
@@ -27,9 +29,14 @@ import type {
   CallToolRequest,
   GetConnectionStatusRequest,
   GetToolsRequest,
+  GetPrimitivesRequest,
+  GetPrimitivesResponse,
   ForceReconnectRequest,
   GetServerConfigRequest,
   UpdateServerConfigRequest,
+  GetOAuthStatusRequest,
+  StartOAuthFlowRequest,
+  ClearOAuthCredentialsRequest,
   HeartbeatRequest,
   ConnectionStatusChangedBroadcast,
   ToolUpdateBroadcast,
@@ -59,6 +66,8 @@ let connectionType: ConnectionType = DEFAULT_CONNECTION_TYPE;
 let isConnected: boolean = false;
 let connectionCount: number = 0;
 let isInitialized: boolean = false;
+let oauthConfig: OAuthConfig = { enabled: false };
+const oauthManager = new OAuthManager();
 
 /**
  * Initialize server URL from Chrome storage
@@ -66,7 +75,7 @@ let isInitialized: boolean = false;
  */
 async function initializeServerConfig(): Promise<void> {
   try {
-    const result = await chrome.storage.local.get(['mcpServerUrl', 'mcpConnectionType']);
+    const result = await chrome.storage.local.get(['mcpServerUrl', 'mcpConnectionType', 'mcpOAuthConfig']);
     
     // Load connection type first to determine default URL
     connectionType = (result.mcpConnectionType as ConnectionType) || DEFAULT_CONNECTION_TYPE;
@@ -77,16 +86,27 @@ async function initializeServerConfig(): Promise<void> {
         : DEFAULT_SSE_URL;
     
     serverUrl = result.mcpServerUrl || defaultUrl;
+    const storedOAuth = (result.mcpOAuthConfig as Partial<OAuthConfig> | undefined) || {};
+    oauthConfig = {
+      enabled: Boolean(storedOAuth.enabled),
+      clientId: storedOAuth.clientId,
+      clientSecret: storedOAuth.clientSecret,
+      scope: storedOAuth.scope,
+      clientName: storedOAuth.clientName,
+      clientMetadataUrl: storedOAuth.clientMetadataUrl,
+    };
     isInitialized = true;
     
     logger.debug('[Background] Server config loaded from storage:', {
       url: serverUrl,
-      type: connectionType
+      type: connectionType,
+      oauthEnabled: oauthConfig.enabled,
     });
   } catch (error) {
     logger.warn('[Background] Failed to load server config from storage, using defaults:', error);
     connectionType = DEFAULT_CONNECTION_TYPE;
     serverUrl = DEFAULT_SSE_URL;
+    oauthConfig = { enabled: false };
     isInitialized = true;
   }
 }
@@ -113,12 +133,253 @@ function getServerUrl(): string {
  * Update the server configuration
  * Replaces mcpInterface.updateServerUrl()
  */
-function updateServerConfig(url: string, type?: ConnectionType): void {
+function updateServerConfig(url: string, type?: ConnectionType, oauth?: OAuthConfig): void {
   serverUrl = url;
   if (type) {
     connectionType = type;
   }
-  logger.debug('[Background] Server config updated to:', { url, type: connectionType });
+  if (oauth) {
+    oauthConfig = oauth;
+  }
+  logger.debug('[Background] Server config updated to:', { url, type: connectionType, oauthEnabled: oauthConfig.enabled });
+}
+
+function getOAuthConfig(): OAuthConfig {
+  return oauthConfig || { enabled: false };
+}
+
+function isOAuthCapableTransport(type: ConnectionType): boolean {
+  return type === 'sse' || type === 'streamable-http';
+}
+
+function getTransportCandidates(uri: string, preferredType: ConnectionType): ConnectionType[] {
+  let url: URL | null = null;
+  try {
+    url = new URL(uri);
+  } catch {
+    return [preferredType];
+  }
+
+  if (url.protocol === 'ws:' || url.protocol === 'wss:') {
+    return ['websocket'];
+  }
+
+  if (preferredType === 'websocket') {
+    return ['websocket'];
+  }
+
+  if (preferredType === 'streamable-http') {
+    return ['streamable-http', 'sse'];
+  }
+
+  return ['sse', 'streamable-http'];
+}
+
+async function persistResolvedTransport(uri: string, type: ConnectionType): Promise<void> {
+  const nextOAuth: OAuthConfig = {
+    ...getOAuthConfig(),
+    enabled: isOAuthCapableTransport(type),
+  };
+
+  await chrome.storage.local.set({
+    mcpServerUrl: uri,
+    mcpConnectionType: type,
+    mcpOAuthConfig: nextOAuth,
+  });
+
+  updateServerConfig(uri, type, nextOAuth);
+  broadcastConfigUpdateToContentScripts({ uri, connectionType: type, oauth: nextOAuth });
+}
+
+function getEffectiveOAuthConfig(type: ConnectionType): OAuthConfig {
+  const cfg = getOAuthConfig();
+  return {
+    ...cfg,
+    // OAuth is automatically available for HTTP transports (SSE/Streamable HTTP).
+    // WebSocket keeps OAuth disabled.
+    enabled: isOAuthCapableTransport(type),
+  };
+}
+
+function getConnectionPluginConfig(url: string, type: ConnectionType): Record<string, unknown> | undefined {
+  const cfg = getEffectiveOAuthConfig(type);
+  const authCfg = oauthManager.buildTransportConfig(url, type, cfg);
+  if (authCfg.authProvider) {
+    return authCfg as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function isUnauthorizedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === 'UnauthorizedError' || /unauthorized/i.test(error.message);
+}
+
+function isInvalidTokenError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    /invalid_token/i.test(error.message) ||
+    /token is invalid/i.test(error.message) ||
+    /authentication failed/i.test(error.message)
+  );
+}
+
+async function forceReconnectWithOAuthRecovery(uri: string, type: ConnectionType): Promise<void> {
+  const candidates = getTransportCandidates(uri, type);
+  let lastError: unknown;
+
+  for (const candidate of candidates) {
+    const pluginConfig = getConnectionPluginConfig(uri, candidate);
+    try {
+      await forceReconnectToMcpServer(uri, candidate, pluginConfig);
+
+      if (candidate !== type) {
+        console.log('[MCP Transport] Auto-selected transport after fallback', {
+          uri,
+          requested: type,
+          resolved: candidate,
+        });
+      }
+
+      if (candidate !== connectionType || uri !== getServerUrl()) {
+        await persistResolvedTransport(uri, candidate);
+      }
+
+      return;
+    } catch (error) {
+      lastError = error;
+      if (isInvalidTokenError(error) && isOAuthCapableTransport(candidate)) {
+        logger.debug('[Background] forceReconnect detected invalid_token. Clearing OAuth credentials and retrying...');
+        console.log('[MCP OAuth] invalid_token detected during reconnect. Clearing OAuth credentials and retrying.', {
+          uri,
+          type: candidate,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(candidate));
+        try {
+          await forceReconnectToMcpServer(uri, candidate, getConnectionPluginConfig(uri, candidate));
+          if (candidate !== connectionType || uri !== getServerUrl()) {
+            await persistResolvedTransport(uri, candidate);
+          }
+          return;
+        } catch (retryError) {
+          lastError = retryError;
+        }
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError ?? 'Unknown reconnect error'));
+}
+
+async function callToolWithOAuthRetry(
+  uri: string,
+  type: ConnectionType,
+  toolName: string,
+  args: Record<string, unknown>,
+  adapterName?: string,
+): Promise<any> {
+  const pluginConfig = getConnectionPluginConfig(uri, type);
+  try {
+    return await callToolWithBackwardsCompatibility(uri, toolName, args, adapterName, type, pluginConfig);
+  } catch (error) {
+    const shouldRecover =
+      (isUnauthorizedError(error) || isInvalidTokenError(error)) &&
+      isOAuthCapableTransport(type);
+    if (!shouldRecover) {
+      throw error;
+    }
+
+    logger.debug('[Background] Auth-related tool error detected, attempting OAuth recovery...');
+    console.log('[MCP OAuth] tool call auth-related failure, attempting recovery', {
+      uri,
+      type,
+      toolName,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    if (isInvalidTokenError(error)) {
+      await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(type));
+    }
+    await forceReconnectWithOAuthRecovery(uri, type);
+    return await callToolWithBackwardsCompatibility(
+      uri,
+      toolName,
+      args,
+      adapterName,
+      type,
+      getConnectionPluginConfig(uri, type),
+    );
+  }
+}
+
+async function getPrimitivesWithOAuthRetry(
+  uri: string,
+  forceRefresh: boolean,
+  type: ConnectionType,
+): Promise<any[]> {
+  const pluginConfig = getConnectionPluginConfig(uri, type);
+  try {
+    return await getPrimitivesWithBackwardsCompatibility(uri, forceRefresh, type, pluginConfig);
+  } catch (error) {
+    const shouldRecover =
+      (isUnauthorizedError(error) || isInvalidTokenError(error)) &&
+      isOAuthCapableTransport(type);
+    if (!shouldRecover) {
+      throw error;
+    }
+
+    logger.debug('[Background] Auth-related primitives error detected, attempting OAuth recovery...');
+    console.log('[MCP OAuth] list primitives auth-related failure, attempting recovery', {
+      uri,
+      type,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    if (isInvalidTokenError(error)) {
+      await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(type));
+    }
+    await forceReconnectWithOAuthRecovery(uri, type);
+    return await getPrimitivesWithBackwardsCompatibility(
+      uri,
+      forceRefresh,
+      type,
+      getConnectionPluginConfig(uri, type),
+    );
+  }
+}
+
+async function getPrimitivesSnapshotWithOAuthRetry(
+  uri: string,
+  forceRefresh: boolean,
+  type: ConnectionType,
+): Promise<any> {
+  const pluginConfig = getConnectionPluginConfig(uri, type);
+  try {
+    return await getPrimitivesSnapshotWithBackwardsCompatibility(uri, forceRefresh, type, pluginConfig);
+  } catch (error) {
+    const shouldRecover =
+      (isUnauthorizedError(error) || isInvalidTokenError(error)) &&
+      isOAuthCapableTransport(type);
+    if (!shouldRecover) {
+      throw error;
+    }
+
+    logger.debug('[Background] Auth-related primitives snapshot error detected, attempting OAuth recovery...');
+    console.log('[MCP OAuth] get primitives snapshot auth-related failure, attempting recovery', {
+      uri,
+      type,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    if (isInvalidTokenError(error)) {
+      await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(type));
+    }
+    await forceReconnectWithOAuthRecovery(uri, type);
+    return await getPrimitivesSnapshotWithBackwardsCompatibility(
+      uri,
+      forceRefresh,
+      type,
+      getConnectionPluginConfig(uri, type),
+    );
+  }
 }
 
 /**
@@ -165,6 +426,32 @@ let isConnecting = false;
 let connectionAttemptCount = 0;
 const MAX_CONNECTION_ATTEMPTS = 3;
 
+function getNetworkSnapshot() {
+  try {
+    return {
+      online: typeof navigator !== 'undefined' ? navigator.onLine : 'unknown',
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+    };
+  } catch {
+    return {
+      online: 'unknown',
+      userAgent: 'unknown',
+    };
+  }
+}
+
+function formatError(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ''}`;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
 /**
  * Enhanced error categorization for better tool vs connection error distinction
  * 
@@ -205,6 +492,9 @@ function categorizeToolError(error: Error): { isConnectionError: boolean; isTool
     /connection failed/i,
     /transport error/i,
     /fetch failed/i,
+    /failed to fetch/i,
+    /cors/i,
+    /access-control-allow-origin/i,
   ];
 
   // Check tool errors first (highest priority)
@@ -291,7 +581,7 @@ async function initializeExtension() {
     if (isConnected) {
       try {
         logger.debug('[Background] Server connected, fetching and broadcasting initial tools...');
-        const primitives = await getPrimitivesWithBackwardsCompatibility(serverUrl, false, connectionType);
+        const primitives = await getPrimitivesWithOAuthRetry(serverUrl, false, connectionType);
         logger.debug(`Retrieved ${primitives.length} primitives for initial broadcast`);
         
         const tools = normalizeTools(primitives);
@@ -331,7 +621,8 @@ async function tryConnectToServer(uri: string, type: ConnectionType = connection
   );
 
   try {
-    await runWithBackwardsCompatibility(uri, type);
+    await forceReconnectWithOAuthRecovery(uri, type);
+    const resolvedType = connectionType;
 
     logger.debug('MCP client connected successfully');
     updateConnectionStatus(true);
@@ -340,7 +631,7 @@ async function tryConnectToServer(uri: string, type: ConnectionType = connection
     // Also broadcast available tools after successful connection
     try {
       logger.debug('[Background] Connection successful, fetching and broadcasting tools...');
-      const primitives = await getPrimitivesWithBackwardsCompatibility(uri, true, type);
+      const primitives = await getPrimitivesWithOAuthRetry(uri, true, resolvedType);
       logger.debug(`Retrieved ${primitives.length} primitives after connection`);
       
       const tools = normalizeTools(primitives);
@@ -354,16 +645,32 @@ async function tryConnectToServer(uri: string, type: ConnectionType = connection
     connectionAttemptCount = 0; // Reset counter on success
   } catch (error: any) {
     const errorCategory = categorizeToolError(error instanceof Error ? error : new Error(String(error)));
-
-    logger.warn(`MCP server connection failed (${errorCategory.category}): ${error.message || String(error)}`);
-    logger.debug('Extension will continue to function with limited capabilities');
+    const errorText = error instanceof Error ? error.message : String(error);
+    if (/Failed to fetch/i.test(errorText)) {
+      console.log('[MCP Background] Failed to fetch while connecting to MCP server', {
+        uri,
+        transport: type,
+        error: errorText,
+        hint: 'Check CORS, endpoint path, HTTPS->HTTP mixed content, and server availability.',
+      });
+    }
+    logger.error('[Background] MCP server connection failed', {
+      category: errorCategory.category,
+      uri,
+      transport: type,
+      attempt: connectionAttemptCount,
+      maxAttempts: MAX_CONNECTION_ATTEMPTS,
+      network: getNetworkSnapshot(),
+      error: formatError(error),
+    });
+    logger.error('[Background] Extension will continue with limited MCP capabilities until reconnect succeeds.');
 
     // Only update connection status for actual connection errors
     if (errorCategory.isConnectionError) {
       updateConnectionStatus(false);
       broadcastConnectionStatusToContentScripts(false, error.message || String(error));
     } else {
-      logger.debug('Error categorized as tool-related, not updating connection status');
+      logger.error('[Background] Connection status unchanged because error was categorized as tool-related.');
     }
 
     // Schedule another attempt if we haven't reached the limit
@@ -373,10 +680,16 @@ async function tryConnectToServer(uri: string, type: ConnectionType = connection
 
       setTimeout(() => {
         isConnecting = false; // Reset connecting flag
-        tryConnectToServer(uri).catch(() => {}); // Try again
+        tryConnectToServer(uri, connectionType).catch(nextError => {
+          logger.error('[Background] Scheduled reconnection attempt failed', {
+            uri,
+            transport: connectionType,
+            error: formatError(nextError),
+          });
+        }); // Try again
       }, delayMs);
     } else {
-      logger.debug('Maximum connection attempts reached. Will try again during periodic check.');
+      logger.error('[Background] Maximum connection attempts reached. Will retry on periodic health checks.');
       // ENHANCED: Don't give up permanently - periodic checks will retry with reset state
       isConnecting = false;
     }
@@ -408,7 +721,7 @@ setInterval(async () => {
     if (isConnected) {
       try {
         logger.debug('[Background] Periodic check: Connection established, fetching and broadcasting tools...');
-        const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), true, connectionType);
+        const primitives = await getPrimitivesWithOAuthRetry(getServerUrl(), true, connectionType);
         logger.debug(`Periodic check: Retrieved ${primitives.length} primitives`);
         
         const tools = normalizeTools(primitives);
@@ -700,7 +1013,7 @@ async function handleMcpMessage(
         }
 
         logger.debug(`Calling tool: ${toolName} from adapter: ${adapterName || 'unknown'}`);
-        result = await callToolWithBackwardsCompatibility(getServerUrl(), toolName, args || {}, adapterName);
+        result = await callToolWithOAuthRetry(getServerUrl(), connectionType, toolName, args || {}, adapterName);
         logger.debug(`Tool call completed: ${toolName}`);
         break;
       }
@@ -734,7 +1047,7 @@ async function handleMcpMessage(
         logger.debug(`Getting tools (forceRefresh: ${forceRefresh})`);
         
         try {
-          const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), forceRefresh, connectionType);
+          const primitives = await getPrimitivesWithOAuthRetry(getServerUrl(), forceRefresh, connectionType);
           logger.debug(`Retrieved ${primitives.length} primitives from server`);
           
           // Use the helper function to normalize tools with proper schema handling
@@ -750,10 +1063,50 @@ async function handleMcpMessage(
         break;
       }
 
+      case 'mcp:get-primitives': {
+        const { forceRefresh = false } = payload as GetPrimitivesRequest;
+        logger.debug(`Getting primitives snapshot (forceRefresh: ${forceRefresh})`);
+
+        try {
+          const snapshot = await getPrimitivesSnapshotWithOAuthRetry(getServerUrl(), forceRefresh, connectionType);
+          const tools = normalizeTools([
+            ...snapshot.tools.map((tool: any) => ({ type: 'tool', value: tool })),
+            ...snapshot.resources.map((resource: any) => ({ type: 'resource', value: resource })),
+            ...snapshot.prompts.map((prompt: any) => ({ type: 'prompt', value: prompt })),
+          ]);
+
+          const response: GetPrimitivesResponse = {
+            tools,
+            resources: snapshot.resources || [],
+            prompts: snapshot.prompts || [],
+            session: {
+              capabilities: snapshot.session?.capabilities,
+              serverInfo: snapshot.session?.serverInfo,
+              instructions: snapshot.session?.instructions,
+            },
+            timestamp: snapshot.timestamp || Date.now(),
+          };
+
+          result = response;
+        } catch (error) {
+          logger.error('[Background] Error getting primitives snapshot:', error);
+          result = {
+            tools: [],
+            resources: [],
+            prompts: [],
+            session: {},
+            timestamp: Date.now(),
+          } satisfies GetPrimitivesResponse;
+        }
+        break;
+      }
+
       case 'mcp:force-reconnect': {
         logger.debug('[Background] Force reconnect requested via context bridge');
         
         try {
+          // User-initiated reconnect may open interactive OAuth if required.
+          oauthManager.allowInteractiveAuth(getServerUrl(), 6);
           // Broadcast reconnection started status
           broadcastConnectionStatusToContentScripts(false, 'Reconnecting...');
           
@@ -764,7 +1117,7 @@ async function handleMcpMessage(
           resetMcpConnectionState();
           
           // Set a reasonable timeout for the reconnection process
-          const reconnectionPromise = forceReconnectToMcpServer(getServerUrl(), connectionType);
+          const reconnectionPromise = forceReconnectWithOAuthRecovery(getServerUrl(), connectionType);
           const timeoutPromise = new Promise<void>((_, reject) => 
             setTimeout(() => reject(new Error('Reconnection timeout after 20 seconds')), 20000)
           );
@@ -783,7 +1136,7 @@ async function handleMcpMessage(
           if (isConnected) {
             try {
               logger.debug('[Background] Fetching tools after successful reconnection...');
-              const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), true, connectionType);
+              const primitives = await getPrimitivesWithOAuthRetry(getServerUrl(), true, connectionType);
               logger.debug(`Retrieved ${primitives.length} primitives after reconnection`);
               
               const tools = normalizeTools(primitives);
@@ -813,11 +1166,19 @@ async function handleMcpMessage(
       }
 
       case 'mcp:get-server-config': {
-        const stored = await chrome.storage.local.get(['mcpServerUrl', 'mcpConnectionType']);
-        const defaultUrl = connectionType === 'websocket' ? DEFAULT_WEBSOCKET_URL : DEFAULT_SSE_URL;
+        const stored = await chrome.storage.local.get(['mcpServerUrl', 'mcpConnectionType', 'mcpOAuthConfig']);
+        const defaultUrl = connectionType === 'websocket'
+          ? DEFAULT_WEBSOCKET_URL
+          : connectionType === 'streamable-http'
+            ? DEFAULT_STREAMABLE_HTTP_URL
+            : DEFAULT_SSE_URL;
         result = { 
           uri: stored.mcpServerUrl || defaultUrl,
-          connectionType: stored.mcpConnectionType || connectionType
+          connectionType: stored.mcpConnectionType || connectionType,
+          oauth: {
+            ...((stored.mcpOAuthConfig as OAuthConfig | undefined) || getOAuthConfig()),
+            enabled: isOAuthCapableTransport(stored.mcpConnectionType || connectionType),
+          },
         };
         break;
       }
@@ -834,28 +1195,37 @@ async function handleMcpMessage(
         if (!newType) {
           try {
             const url = new URL(config.uri);
-            newType = (url.protocol === 'ws:' || url.protocol === 'wss:') ? 'websocket' : 'sse';
+            newType = (url.protocol === 'ws:' || url.protocol === 'wss:') ? 'websocket' : 'streamable-http';
           } catch {
             newType = connectionType; // fallback to current type
           }
         }
-        logger.debug(`Updating server config to: ${config.uri} (${newType})`);
+        const incomingOAuth = (config.oauth || {}) as Partial<OAuthConfig>;
+        const nextOAuth: OAuthConfig = {
+          ...getOAuthConfig(),
+          ...incomingOAuth,
+          enabled: isOAuthCapableTransport(newType),
+        };
+        logger.debug(`Updating server config to: ${config.uri} (${newType})`, { oauthEnabled: nextOAuth.enabled });
         
         // Update storage and background script state
         await chrome.storage.local.set({ 
           mcpServerUrl: config.uri,
-          mcpConnectionType: newType
+          mcpConnectionType: newType,
+          mcpOAuthConfig: nextOAuth,
         });
-        updateServerConfig(config.uri, newType);
+        updateServerConfig(config.uri, newType, nextOAuth);
         
         // Broadcast config update immediately
-        broadcastConfigUpdateToContentScripts({ uri: config.uri, connectionType: newType });
+        broadcastConfigUpdateToContentScripts({ uri: config.uri, connectionType: newType, oauth: nextOAuth });
         
         // Start async reconnection but don't block the response
         const reconnectPromise = (async () => {
           try {
             logger.debug('[Background] Starting async reconnection after config update...');
-            await forceReconnectToMcpServer(config.uri, newType);
+            // Save action is user-initiated; allow one interactive OAuth window if needed.
+            oauthManager.allowInteractiveAuth(config.uri, 6);
+            await forceReconnectWithOAuthRecovery(config.uri, newType);
             const isConnected = await checkMcpServerConnection();
             updateConnectionStatus(isConnected);
             broadcastConnectionStatusToContentScripts(isConnected);
@@ -864,7 +1234,7 @@ async function handleMcpMessage(
             // If connected, fetch and broadcast tools
             if (isConnected) {
               try {
-                const primitives = await getPrimitivesWithBackwardsCompatibility(config.uri, true, newType);
+                const primitives = await getPrimitivesWithOAuthRetry(config.uri, true, newType);
                 const tools = normalizeTools(primitives);
                 broadcastToolsUpdateToContentScripts(tools);
                 logger.debug(`Broadcasted ${tools.length} normalized tools after config update`);
@@ -886,6 +1256,50 @@ async function handleMcpMessage(
           logger.error('[Background] Unhandled error in async reconnection:', error);
         });
         
+        result = { success: true };
+        break;
+      }
+
+      case 'mcp:get-oauth-status': {
+        const status = await oauthManager.getStatus(getServerUrl(), getEffectiveOAuthConfig(connectionType));
+        result = status;
+        break;
+      }
+
+      case 'mcp:start-oauth': {
+        if (!isOAuthCapableTransport(connectionType)) {
+          result = {
+            success: false,
+            hasTokens: false,
+            error: 'OAuth is only supported for SSE and Streamable HTTP transports.',
+          };
+          break;
+        }
+
+        try {
+          // Explicit authorize action from user: allow interactive OAuth.
+          oauthManager.allowInteractiveAuth(getServerUrl(), 6);
+          await forceReconnectWithOAuthRecovery(getServerUrl(), connectionType);
+          const status = await oauthManager.getStatus(getServerUrl(), getEffectiveOAuthConfig(connectionType));
+          result = {
+            success: status.hasTokens,
+            hasTokens: status.hasTokens,
+            message: status.hasTokens ? 'OAuth authorization completed.' : 'OAuth did not return an access token.',
+            ...(status.error ? { error: status.error } : {}),
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          result = {
+            success: false,
+            hasTokens: false,
+            error: message,
+          };
+        }
+        break;
+      }
+
+      case 'mcp:clear-oauth': {
+        await oauthManager.clearCredentials(getServerUrl(), getEffectiveOAuthConfig(connectionType));
         result = { success: true };
         break;
       }
@@ -1029,7 +1443,7 @@ function broadcastToolsUpdateToContentScripts(tools: any[]) {
  * 
  * @param config - The updated server configuration
  */
-function broadcastConfigUpdateToContentScripts(config: { uri: string; connectionType?: string }) {
+function broadcastConfigUpdateToContentScripts(config: { uri: string; connectionType?: string; oauth?: OAuthConfig }) {
   logger.debug(`Broadcasting config update to content scripts: ${config.uri}`);
   
   const broadcastMessage: BaseMessage & { payload: ServerConfigUpdatedBroadcast } = {
@@ -1179,4 +1593,3 @@ async function initializeRemoteConfig(): Promise<void> {
     // Don't throw - let the extension continue without remote config
   }
 }
-

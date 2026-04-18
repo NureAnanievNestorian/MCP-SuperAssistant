@@ -67,7 +67,7 @@ const updateExistingFunctionBlock = (
       // Find the original pre element to get the raw content
       const originalPre = document.querySelector(`div[data-block-id="${blockId}"]`);
       if (originalPre && originalPre.textContent?.trim()) {
-        addExecuteButton(block as HTMLDivElement, originalPre.textContent!.trim());
+        addExecuteButton(block as HTMLDivElement, originalPre.textContent!.trim(), functionInfo.invokeName);
       }
     }
   } else {

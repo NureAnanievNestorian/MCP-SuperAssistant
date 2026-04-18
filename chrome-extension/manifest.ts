@@ -19,6 +19,7 @@ const packageJson = JSON.parse(readFileSync('./package.json', 'utf8'));
  */
 const manifest = {
   manifest_version: 3,
+  key: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6hDYe/sPbu/8W4OMsG2vD9OOG5p1wVr/9al2pZMh5D9+wIib6yK2ZWwBZUh23D2NPGeSxzYyr7nWhb/ZsFHEDsDgRSAqpWu7fo2nr0aqAKYQnHp6HwhXj0nu4/zQCemh8zyCgUkLfmes6MfwQ7lseiNwZhxzrmT6hJSbbwbjQt5JRWfcKY+Yg7NJpksQ1qXZ/TnmDVURY7NPhh02LyQCh3+qU9+fxAJ+dOGsBVRdBgGDkMlk9sp1s0JiHJhMXHYeUat7tFJxXo/gb61px5o3CvGTG3xcbIQ67pQwTiQDY00/tECEsp0wQFh/aF5tXEs8YjWFldOeJEZ9Av07j2+r5QIDAQAB',
   default_locale: 'en',
   name: 'MCP SuperAssistant',
   browser_specific_settings: {
@@ -50,7 +51,7 @@ const manifest = {
 
   ],
 
-  permissions: ['storage', 'clipboardWrite'],
+  permissions: ['storage', 'clipboardWrite', 'identity'],
   // permissions: ['storage', 'scripting', 'clipboardWrite'],
   // options_page: 'options/index.html',
   background: {

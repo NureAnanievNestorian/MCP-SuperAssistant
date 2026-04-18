@@ -72,6 +72,7 @@ export interface ToolExecutionCompleteDetail {
   result?: string;
   isFileAttachment?: boolean;
   file?: File;
+  files?: File[];
   fileName?: string;
   confirmationText?: string;
   skipAutoInsertCheck?: boolean;
@@ -214,6 +215,13 @@ export class AutomationService {
       await this.exposeAutomationStateToWindow();
 
       logger.debug('[AutomationService] Current automation state:', automationState);
+      logger.debug('[AutomationService] Runtime context snapshot:', {
+        visibilityState: document.visibilityState,
+        hasFocus: document.hasFocus(),
+        activeElement: document.activeElement?.tagName || 'none',
+        activeElementId: (document.activeElement as HTMLElement | null)?.id || '',
+        activeElementClass: (document.activeElement as HTMLElement | null)?.className || '',
+      });
 
       // Handle Auto Execute (always run if enabled, independent of other actions)
       if (automationState.autoExecute) {
@@ -223,10 +231,10 @@ export class AutomationService {
       // Handle Auto Insert and Auto Submit logic
       // Skip auto-insert if skipAutoInsertCheck is true (for manual actions)
       const shouldAutoInsert = automationState.autoInsert && !detail.skipAutoInsertCheck;
-      
+
       if (shouldAutoInsert) {
         const insertSuccess = await this.handleAutoInsert(detail);
-        
+
         // Only proceed with auto submit if auto insert was successful
         // and auto submit is enabled
         if (insertSuccess && automationState.autoSubmit) {
@@ -329,88 +337,66 @@ export class AutomationService {
       const { plugin: activePlugin, insertText, attachFile, isReady } = await storeRefs.getCurrentAdapterState();
 
       if (!isReady || !activePlugin) {
-        logger.warn('[AutomationService] No active adapter available for auto insert');
+        logger.warn('[AutomationService] No active adapter available for auto insert', {
+          isReady,
+          hasActivePlugin: !!activePlugin,
+        });
         return false;
       }
 
       logger.debug('[AutomationService] Using adapter for auto insert:', activePlugin.name);
 
-      // Handle file attachment
+      // Handle result with embedded files (base64 decoded, replaced with [file #N] placeholders)
+      if (detail.files && detail.files.length > 0 && attachFile) {
+        logger.debug('[AutomationService] Auto inserting result with', detail.files.length, 'file(s)');
+        for (const file of detail.files) {
+          try {
+            await attachFile(file);
+            await new Promise(resolve => setTimeout(resolve, 400));
+          } catch (err) {
+            logger.error('[AutomationService] Error attaching file:', file.name, err);
+          }
+        }
+        if (detail.result && insertText) {
+          try {
+            await insertText(detail.result);
+          } catch (err) {
+            logger.error('[AutomationService] Error inserting text after file attach:', err);
+          }
+        }
+        return true;
+      }
+
+      // Handle legacy single-file attachment
       if (detail.isFileAttachment && detail.file && attachFile) {
         logger.debug('[AutomationService] Auto inserting file:', detail.file.name);
-        
         try {
           const success = await attachFile(detail.file);
-          
-          if (success) {
-            logger.debug('[AutomationService] File attached successfully via auto insert');
-            
-            // Optionally insert confirmation text if provided
-            if (detail.confirmationText && insertText) {
-              logger.debug('[AutomationService] Inserting file confirmation text');
-              // Small delay to ensure file attachment is processed
-              setTimeout(async () => {
-                try {
-                  await insertText(detail.confirmationText!);
-                } catch (error) {
-                  logger.error('[AutomationService] Error inserting confirmation text:', error);
-                }
-              }, 100);
-            }
-            
-            return true;
-          } else {
-            logger.warn('[AutomationService] File attachment failed');
-            return false;
+          if (success && detail.confirmationText && insertText) {
+            setTimeout(async () => {
+              try { await insertText(detail.confirmationText!); } catch {}
+            }, 100);
           }
-        } catch (attachError) {
-          logger.error('[AutomationService] Error calling attachFile method:', attachError);
-          logger.error('[AutomationService] attachFile context info:', {
-            hasAttachFile: !!attachFile,
-            attachFileType: typeof attachFile,
-            activePluginName: activePlugin?.name,
-            fileName: detail.file?.name
-          });
+          return success;
+        } catch (err) {
+          logger.error('[AutomationService] Error attaching file:', err);
           return false;
         }
       }
-      
-      // Handle text insertion
-      else if (detail.result && insertText) {
+
+      // Handle plain text insertion
+      if (detail.result && insertText) {
         logger.debug('[AutomationService] Auto inserting text result');
-        
         try {
-          const success = await insertText(detail.result);
-          
-          if (success) {
-            logger.debug('[AutomationService] Text inserted successfully via auto insert');
-            return true;
-          } else {
-            logger.warn('[AutomationService] Text insertion failed');
-            return false;
-          }
-        } catch (insertError) {
-          logger.error('[AutomationService] Error calling insertText method:', insertError);
-          logger.error('[AutomationService] insertText context info:', {
-            hasInsertText: !!insertText,
-            insertTextType: typeof insertText,
-            activePluginName: activePlugin?.name
-          });
+          return await insertText(detail.result);
+        } catch (err) {
+          logger.error('[AutomationService] Error inserting text:', err);
           return false;
         }
       }
       
-      // No valid insertion method found
-      else {
-        logger.warn('[AutomationService] No valid insertion method found for auto insert', {
-          hasResult: !!detail.result,
-          isFileAttachment: detail.isFileAttachment,
-          hasFile: !!detail.file,
-          hasInsertText: !!insertText,
-          hasAttachFile: !!attachFile
-        });
-        return false;
-      }
+      logger.warn('[AutomationService] No valid insertion method found for auto insert');
+      return false;
 
     } catch (error) {
       logger.error('[AutomationService] Error during auto insert:', error);
@@ -443,25 +429,55 @@ export class AutomationService {
       const { plugin: activePlugin, submitForm, isReady } = await storeRefs.getCurrentAdapterState();
 
       if (!isReady || !activePlugin || !submitForm) {
-        logger.warn('[AutomationService] No active adapter or submit capability available for auto submit');
+        logger.warn('[AutomationService] No active adapter or submit capability available for auto submit', {
+          isReady,
+          hasActivePlugin: !!activePlugin,
+          hasSubmitForm: !!submitForm,
+        });
         return false;
       }
 
       logger.debug('[AutomationService] Using adapter for auto submit:', activePlugin.name);
+      logger.debug('[AutomationService] Auto submit runtime context:', {
+        visibilityState: document.visibilityState,
+        hasFocus: document.hasFocus(),
+        activeElement: document.activeElement?.tagName || 'none',
+      });
 
       // Add a small delay to ensure any prior insertion/attachment has settled in the UI
       await new Promise(resolve => setTimeout(resolve, 800));
 
       try {
-        const success = await submitForm();
-        
-        if (success) {
-          logger.debug('[AutomationService] Form submitted successfully via auto submit');
-          return true;
-        } else {
-          logger.warn('[AutomationService] Form submission failed');
-          return false;
+        // Retry submit because some targets (Gemini) keep send button disabled briefly after insertion.
+        const maxSubmitAttempts = 3;
+        const retryDelayMs = 450;
+
+        for (let attempt = 1; attempt <= maxSubmitAttempts; attempt++) {
+          const success = await submitForm();
+          if (success) {
+            logger.debug('[AutomationService] Form submitted successfully via auto submit', {
+              attempt,
+              adapter: activePlugin.name,
+            });
+            return true;
+          }
+
+          logger.warn('[AutomationService] Form submission attempt failed', {
+            attempt,
+            maxSubmitAttempts,
+            adapter: activePlugin.name,
+          });
+
+          if (attempt < maxSubmitAttempts) {
+            await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+          }
         }
+
+        logger.error('[AutomationService] Form submission failed after retries', {
+          attempts: maxSubmitAttempts,
+          adapter: activePlugin.name,
+        });
+        return false;
       } catch (submitError) {
         logger.error('[AutomationService] Error calling submitForm method:', submitError);
         logger.error('[AutomationService] submitForm context info:', {

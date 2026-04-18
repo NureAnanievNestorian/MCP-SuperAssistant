@@ -33,6 +33,9 @@ const defaultServerConfig: ServerConfig = {
   timeout: 5000, // ms
   retryAttempts: 3,
   retryDelay: 2000, // ms
+  oauth: {
+    enabled: true,
+  },
 };
 
 const initialState: Omit<ConnectionState, 'setStatus' | 'setServerConfig' | 'setLastError' | 'incrementAttempts' | 'resetAttempts' | 'setConnected' | 'setDisconnected' | 'startReconnecting' | 'stopReconnecting'> = {

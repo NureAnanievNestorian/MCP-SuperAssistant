@@ -211,19 +211,36 @@ export class GeminiAdapter extends BaseAdapterPlugin {
       // Store the original value
       const originalValue = targetElement.textContent || '';
 
-      // Focus the input element
-      targetElement.focus();
+      // execCommand('insertText') requires focus on the actual [contenteditable] element.
+      // The selector may return a <p> child inside Quill — walk up to the contenteditable.
+      const editableElement = (targetElement.closest('[contenteditable="true"]') as HTMLElement) || targetElement;
+      editableElement.focus();
 
-      // Insert the text by updating the content and dispatching appropriate events
-      // Append the text to the original value on a new line if there's existing content
-      const newContent = originalValue ? originalValue + '\n' + text : text;
-      targetElement.textContent = newContent;
+      // Place cursor at end of existing content
+      const selection = window.getSelection();
+      if (selection) {
+        const range = document.createRange();
+        range.selectNodeContents(editableElement);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
 
-      // Dispatch events to simulate user typing for better compatibility
-      targetElement.dispatchEvent(new Event('input', { bubbles: true }));
-      targetElement.dispatchEvent(new Event('change', { bubbles: true }));
-      targetElement.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
-      targetElement.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+      const insertContent = originalValue ? '\n' + text : text;
+      const execResult = document.execCommand('insertText', false, insertContent);
+
+      // Fallback: if execCommand is not supported, update DOM directly and fire events
+      if (!execResult) {
+        const newContent = originalValue ? originalValue + '\n' + text : text;
+        editableElement.textContent = newContent;
+        editableElement.dispatchEvent(new Event('input', { bubbles: true }));
+        if (typeof InputEvent !== 'undefined') {
+          editableElement.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+        }
+        editableElement.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      const newContent = editableElement.textContent || '';
 
       // Emit success event to the new event system
       this.emitExecutionCompleted('insertText', { text }, {
@@ -250,60 +267,182 @@ export class GeminiAdapter extends BaseAdapterPlugin {
   async submitForm(options?: { formElement?: HTMLFormElement }): Promise<boolean> {
     this.context.logger.debug('Attempting to submit Gemini chat input');
 
-    let submitButton: HTMLButtonElement | null = null;
-
     // Try multiple selectors for better compatibility
-    const selectors = this.getSelector('submitButton').split(', ');
-    for (const selector of selectors) {
-      submitButton = document.querySelector(selector.trim()) as HTMLButtonElement;
-      if (submitButton) {
-        this.context.logger.debug(`Found submit button using selector: ${selector.trim()}`);
-        break;
-      }
-    }
-
-    if (!submitButton) {
-      this.context.logger.error('Could not find Gemini submit button');
-      this.emitExecutionFailed('submitForm', 'Submit button not found');
-      return false;
-    }
+    const selectors = this.getSelector('submitButton')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
 
     try {
-      // Check if the button is disabled
-      if (submitButton.disabled) {
-        this.context.logger.warn('Gemini submit button is disabled');
-        this.emitExecutionFailed('submitForm', 'Submit button is disabled');
-        return false;
+      // Gemini UI can keep the send button in a transient disabled/hidden state
+      // while the editor is processing input. Retry before giving up.
+      const maxAttempts = 8;
+      const retryDelayMs = 250;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const buttonCandidate = this.findBestSubmitButton(selectors);
+
+        if (buttonCandidate.element && buttonCandidate.clickable) {
+          this.context.logger.debug(
+            `Using Gemini submit button (attempt ${attempt}/${maxAttempts}) selector: ${buttonCandidate.selector || 'unknown'}`,
+          );
+
+          buttonCandidate.element.click();
+
+          this.emitExecutionCompleted('submitForm', {
+            formElement: options?.formElement?.tagName || 'unknown'
+          }, {
+            success: true,
+            method: 'submitButton.click',
+            buttonSelector: buttonCandidate.selector || 'unknown',
+            attempts: attempt
+          });
+
+          this.context.logger.debug(`Gemini chat input submitted successfully on attempt ${attempt}`);
+          return true;
+        }
+
+        if (attempt < maxAttempts) {
+          this.context.logger.debug(
+            `Gemini submit button not ready on attempt ${attempt}/${maxAttempts}: ${buttonCandidate.reason}`,
+          );
+          await this.delay(retryDelayMs);
+        }
       }
 
-      // Check if the button is visible and clickable
-      const rect = submitButton.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) {
-        this.context.logger.warn('Gemini submit button is not visible');
-        this.emitExecutionFailed('submitForm', 'Submit button is not visible');
-        return false;
+      // Fallback: dispatch Enter in chat editor when button click path is unavailable.
+      const editor = this.findGeminiInputElement();
+      if (editor) {
+        editor.focus();
+        editor.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          bubbles: true,
+          cancelable: true,
+        }));
+        editor.dispatchEvent(new KeyboardEvent('keypress', {
+          key: 'Enter',
+          code: 'Enter',
+          bubbles: true,
+          cancelable: true,
+        }));
+        editor.dispatchEvent(new KeyboardEvent('keyup', {
+          key: 'Enter',
+          code: 'Enter',
+          bubbles: true,
+          cancelable: true,
+        }));
+
+        this.emitExecutionCompleted('submitForm', {
+          formElement: options?.formElement?.tagName || 'unknown'
+        }, {
+          success: true,
+          method: 'keyboard.enter.fallback'
+        });
+
+        this.context.logger.debug('Gemini chat input submitted using Enter fallback');
+        return true;
       }
-
-      // Click the submit button to send the message
-      submitButton.click();
-
-      // Emit success event to the new event system
-      this.emitExecutionCompleted('submitForm', {
-        formElement: options?.formElement?.tagName || 'unknown'
-      }, {
-        success: true,
-        method: 'submitButton.click',
-        buttonSelector: selectors.find(s => document.querySelector(s.trim()) === submitButton)
-      });
-
-      this.context.logger.debug('Gemini chat input submitted successfully');
-      return true;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       this.context.logger.error(`Error submitting Gemini chat input: ${errorMessage}`);
       this.emitExecutionFailed('submitForm', errorMessage);
       return false;
     }
+
+    this.context.logger.error('Gemini submit failed after retries and fallback');
+    this.emitExecutionFailed('submitForm', 'Submit button not ready after retries');
+    return false;
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private findGeminiInputElement(): HTMLElement | null {
+    const selectors = this.getSelector('chatInput')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    for (const selector of selectors) {
+      const element = document.querySelector(selector) as HTMLElement | null;
+      if (element && this.isElementVisible(element)) {
+        return element;
+      }
+    }
+
+    return document.querySelector('div[contenteditable="true"]') as HTMLElement | null;
+  }
+
+  private findBestSubmitButton(selectors: string[]): { element: HTMLElement | null; selector: string | null; clickable: boolean; reason: string } {
+    let firstFound: { element: HTMLElement; selector: string } | null = null;
+    let firstVisible: { element: HTMLElement; selector: string } | null = null;
+
+    for (const selector of selectors) {
+      const matchedElements = Array.from(document.querySelectorAll(selector)) as HTMLElement[];
+
+      for (const element of matchedElements) {
+        if (!firstFound) {
+          firstFound = { element, selector };
+        }
+
+        const visible = this.isElementVisible(element);
+        if (visible && !firstVisible) {
+          firstVisible = { element, selector };
+        }
+
+        if (visible && this.isElementEnabled(element)) {
+          return {
+            element,
+            selector,
+            clickable: true,
+            reason: 'Found visible and enabled submit button',
+          };
+        }
+      }
+    }
+
+    if (firstVisible) {
+      return {
+        element: firstVisible.element,
+        selector: firstVisible.selector,
+        clickable: false,
+        reason: 'Found visible submit button but it is disabled',
+      };
+    }
+
+    if (firstFound) {
+      return {
+        element: firstFound.element,
+        selector: firstFound.selector,
+        clickable: false,
+        reason: 'Found submit button but it is not visible/clickable',
+      };
+    }
+
+    return {
+      element: null,
+      selector: null,
+      clickable: false,
+      reason: 'No submit button found',
+    };
+  }
+
+  private isElementEnabled(element: HTMLElement): boolean {
+    const asButton = element as HTMLButtonElement;
+    const ariaDisabled = element.getAttribute('aria-disabled');
+    return !asButton.disabled && ariaDisabled !== 'true' && !element.hasAttribute('disabled');
+  }
+
+  private isElementVisible(element: HTMLElement): boolean {
+    const style = window.getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
   }
 
   /**
@@ -1053,15 +1192,19 @@ export class GeminiAdapter extends BaseAdapterPlugin {
           
           // Get the persistent MCP enabled state and other preferences
           const mcpEnabled = uiState?.mcpEnabled ?? false;
+          const autoInsertEnabled = uiState?.preferences?.autoInsert ?? false;
           const autoSubmitEnabled = uiState?.preferences?.autoSubmit ?? false;
+          const autoExecuteEnabled = uiState?.preferences?.autoExecute ?? false;
 
-          context.logger.debug(`Getting MCP toggle state: mcpEnabled=${mcpEnabled}, autoSubmit=${autoSubmitEnabled}`);
+          context.logger.debug(
+            `[GeminiToggleState] getState mcpEnabled=${mcpEnabled}, autoInsert=${autoInsertEnabled}, autoSubmit=${autoSubmitEnabled}, autoExecute=${autoExecuteEnabled}`,
+          );
 
           return {
             mcpEnabled: mcpEnabled, // Use the persistent MCP state
-            autoInsert: autoSubmitEnabled,
+            autoInsert: autoInsertEnabled,
             autoSubmit: autoSubmitEnabled,
-            autoExecute: false // Default for now, can be extended
+            autoExecute: autoExecuteEnabled
           };
         } catch (error) {
           context.logger.error('Error getting toggle state:', error);
@@ -1124,7 +1267,7 @@ export class GeminiAdapter extends BaseAdapterPlugin {
 
         // Update preferences through store
         if (context.stores.ui?.updatePreferences) {
-          context.stores.ui.updatePreferences({ autoSubmit: enabled });
+          context.stores.ui.updatePreferences({ autoInsert: enabled });
         }
 
         stateManager.updateUI();
@@ -1143,7 +1286,12 @@ export class GeminiAdapter extends BaseAdapterPlugin {
 
       setAutoExecute: (enabled: boolean) => {
         context.logger.debug(`Setting Auto Execute ${enabled ? 'enabled' : 'disabled'}`);
-        // Can be extended to handle auto execute functionality
+
+        // Update preferences through store
+        if (context.stores.ui?.updatePreferences) {
+          context.stores.ui.updatePreferences({ autoExecute: enabled });
+        }
+
         stateManager.updateUI();
       },
 

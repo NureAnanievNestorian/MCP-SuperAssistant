@@ -100,6 +100,11 @@ When a user makes a request:
 8. DO NOT STRICTLY GENERATE or form function results.
 9. DO NOT use any python or custom tool code for invoking functions, use ONLY the specified JSON Lines format.
 
+CRITICAL RULE: ONE FUNCTION CALL PER MESSAGE — STRICTLY ENFORCED
+You MUST stop after each function call and wait for the user to provide the result.
+Do NOT chain multiple function calls in one response under any circumstances.
+Even if the task requires 10 steps — do them ONE AT A TIME.
+
 Answer the user\'s request using the relevant tool(s), if they are available. Check that all the required parameters for each tool call are provided or can reasonably be inferred from context. IF there are no relevant tools or there are missing values for required parameters, ask the user to supply these values; otherwise proceed with the tool calls. If the user provides a specific value for a parameter (for example provided in quotes), make sure to use that value EXACTLY. DO NOT make up values for or ask about optional parameters. Carefully analyze descriptive terms in the request as they may indicate required parameter values that should be included even if not explicitly quoted.
 
 
@@ -366,6 +371,8 @@ ClassName | Custom class | User
   // instructions += '- Check parameter types carefully to avoid errors\n';
   // instructions += '- You can execute tools directly from the sidebar by clicking the Execute button\n';
   instructions += '\n\n';
+
+  instructions += 'REMINDER: After each ```jsonl``` block — STOP. One call per message. No exceptions. Wait for execution result.\n\n';
 
   instructions += 'User Interaction Starts here:';
   instructions += '\n\n\n';

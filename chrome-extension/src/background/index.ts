@@ -68,6 +68,7 @@ let connectionCount: number = 0;
 let isInitialized: boolean = false;
 let oauthConfig: OAuthConfig = { enabled: false };
 const oauthManager = new OAuthManager();
+const oauthRecoveryLocks = new Map<string, Promise<void>>();
 
 /**
  * Initialize server URL from Chrome storage
@@ -224,52 +225,114 @@ function isInvalidTokenError(error: unknown): boolean {
   );
 }
 
+function isTokenExchangeFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    /oauth\/token/i.test(error.message) ||
+    /token exchange/i.test(error.message) ||
+    /invalid_grant/i.test(error.message) ||
+    /invalid_request/i.test(error.message) ||
+    /bad request/i.test(error.message) ||
+    /\b400\b/.test(error.message)
+  );
+}
+
+async function runExclusiveOAuthRecovery(uri: string, task: () => Promise<void>): Promise<void> {
+  const existing = oauthRecoveryLocks.get(uri);
+  if (existing) {
+    console.log('[MCP OAuth] retry suppressed because flow already pending', { uri });
+    await existing;
+    return;
+  }
+
+  const promise = task().finally(() => {
+    if (oauthRecoveryLocks.get(uri) === promise) {
+      oauthRecoveryLocks.delete(uri);
+    }
+  });
+
+  oauthRecoveryLocks.set(uri, promise);
+  await promise;
+}
+
 async function forceReconnectWithOAuthRecovery(uri: string, type: ConnectionType): Promise<void> {
-  const candidates = getTransportCandidates(uri, type);
-  let lastError: unknown;
+  await runExclusiveOAuthRecovery(uri, async () => {
+    const candidates = getTransportCandidates(uri, type);
+    let lastError: unknown;
 
-  for (const candidate of candidates) {
-    const pluginConfig = getConnectionPluginConfig(uri, candidate);
-    try {
-      await forceReconnectToMcpServer(uri, candidate, pluginConfig);
+    for (const candidate of candidates) {
+      const candidateConfig = getEffectiveOAuthConfig(candidate);
+      const pluginConfig = getConnectionPluginConfig(uri, candidate);
+      try {
+        await forceReconnectToMcpServer(uri, candidate, pluginConfig);
 
-      if (candidate !== type) {
-        console.log('[MCP Transport] Auto-selected transport after fallback', {
-          uri,
-          requested: type,
-          resolved: candidate,
-        });
-      }
+        if (candidate !== type) {
+          console.log('[MCP Transport] Auto-selected transport after fallback', {
+            uri,
+            requested: type,
+            resolved: candidate,
+          });
+        }
 
-      if (candidate !== connectionType || uri !== getServerUrl()) {
-        await persistResolvedTransport(uri, candidate);
-      }
-
-      return;
-    } catch (error) {
-      lastError = error;
-      if (isInvalidTokenError(error) && isOAuthCapableTransport(candidate)) {
-        logger.debug('[Background] forceReconnect detected invalid_token. Clearing OAuth credentials and retrying...');
-        console.log('[MCP OAuth] invalid_token detected during reconnect. Clearing OAuth credentials and retrying.', {
-          uri,
-          type: candidate,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(candidate));
-        try {
-          await forceReconnectToMcpServer(uri, candidate, getConnectionPluginConfig(uri, candidate));
-          if (candidate !== connectionType || uri !== getServerUrl()) {
-            await persistResolvedTransport(uri, candidate);
+        if (candidate !== connectionType || uri !== getServerUrl()) {
+          await persistResolvedTransport(uri, candidate);
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        const pendingFlow = await oauthManager.hasPendingFlow(uri, candidateConfig);
+        if (pendingFlow) {
+          const flow = await oauthManager.getFlowDebugInfo(uri, candidateConfig);
+          console.log('[MCP OAuth] auth flow failed while pending. Resetting flow and retrying once.', {
+            uri,
+            type: candidate,
+            flowId: flow?.flowId,
+            stage: flow?.stage,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await oauthManager.failPendingFlow(uri, candidateConfig, 'pending-flow-failed', error);
+          try {
+            await forceReconnectToMcpServer(uri, candidate, getConnectionPluginConfig(uri, candidate));
+            if (candidate !== connectionType || uri !== getServerUrl()) {
+              await persistResolvedTransport(uri, candidate);
+            }
+            return;
+          } catch (retryError) {
+            lastError = retryError;
+            if (isTokenExchangeFailure(retryError) || isInvalidTokenError(retryError) || isUnauthorizedError(retryError)) {
+              await oauthManager.failPendingFlow(uri, candidateConfig, 'clean-retry-failed', retryError);
+              break;
+            }
           }
-          return;
-        } catch (retryError) {
-          lastError = retryError;
+        }
+
+        if (isInvalidTokenError(error) && isOAuthCapableTransport(candidate)) {
+          logger.debug('[Background] forceReconnect detected invalid_token. Clearing OAuth credentials and retrying...');
+          console.log('[MCP OAuth] invalid_token detected during reconnect. Clearing OAuth credentials and retrying.', {
+            uri,
+            type: candidate,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(candidate));
+          try {
+            await forceReconnectToMcpServer(uri, candidate, getConnectionPluginConfig(uri, candidate));
+            if (candidate !== connectionType || uri !== getServerUrl()) {
+              await persistResolvedTransport(uri, candidate);
+            }
+            return;
+          } catch (retryError) {
+            lastError = retryError;
+            if (isTokenExchangeFailure(retryError) || isUnauthorizedError(retryError)) {
+              await oauthManager.failPendingFlow(uri, candidateConfig, 'invalid-token-clean-retry-failed', retryError);
+              break;
+            }
+          }
         }
       }
     }
-  }
 
-  throw lastError instanceof Error ? lastError : new Error(String(lastError ?? 'Unknown reconnect error'));
+    throw lastError instanceof Error ? lastError : new Error(String(lastError ?? 'Unknown reconnect error'));
+  });
 }
 
 async function callToolWithOAuthRetry(
@@ -284,7 +347,7 @@ async function callToolWithOAuthRetry(
     return await callToolWithBackwardsCompatibility(uri, toolName, args, adapterName, type, pluginConfig);
   } catch (error) {
     const shouldRecover =
-      (isUnauthorizedError(error) || isInvalidTokenError(error)) &&
+      (isUnauthorizedError(error) || isInvalidTokenError(error) || isTokenExchangeFailure(error)) &&
       isOAuthCapableTransport(type);
     if (!shouldRecover) {
       throw error;
@@ -299,6 +362,8 @@ async function callToolWithOAuthRetry(
     });
     if (isInvalidTokenError(error)) {
       await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(type));
+    } else if (isTokenExchangeFailure(error)) {
+      await oauthManager.failPendingFlow(uri, getEffectiveOAuthConfig(type), 'tool-call-token-exchange-failed', error);
     }
     await forceReconnectWithOAuthRecovery(uri, type);
     return await callToolWithBackwardsCompatibility(
@@ -322,7 +387,7 @@ async function getPrimitivesWithOAuthRetry(
     return await getPrimitivesWithBackwardsCompatibility(uri, forceRefresh, type, pluginConfig);
   } catch (error) {
     const shouldRecover =
-      (isUnauthorizedError(error) || isInvalidTokenError(error)) &&
+      (isUnauthorizedError(error) || isInvalidTokenError(error) || isTokenExchangeFailure(error)) &&
       isOAuthCapableTransport(type);
     if (!shouldRecover) {
       throw error;
@@ -336,6 +401,8 @@ async function getPrimitivesWithOAuthRetry(
     });
     if (isInvalidTokenError(error)) {
       await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(type));
+    } else if (isTokenExchangeFailure(error)) {
+      await oauthManager.failPendingFlow(uri, getEffectiveOAuthConfig(type), 'list-primitives-token-exchange-failed', error);
     }
     await forceReconnectWithOAuthRecovery(uri, type);
     return await getPrimitivesWithBackwardsCompatibility(
@@ -357,7 +424,7 @@ async function getPrimitivesSnapshotWithOAuthRetry(
     return await getPrimitivesSnapshotWithBackwardsCompatibility(uri, forceRefresh, type, pluginConfig);
   } catch (error) {
     const shouldRecover =
-      (isUnauthorizedError(error) || isInvalidTokenError(error)) &&
+      (isUnauthorizedError(error) || isInvalidTokenError(error) || isTokenExchangeFailure(error)) &&
       isOAuthCapableTransport(type);
     if (!shouldRecover) {
       throw error;
@@ -371,6 +438,8 @@ async function getPrimitivesSnapshotWithOAuthRetry(
     });
     if (isInvalidTokenError(error)) {
       await oauthManager.clearCredentials(uri, getEffectiveOAuthConfig(type));
+    } else if (isTokenExchangeFailure(error)) {
+      await oauthManager.failPendingFlow(uri, getEffectiveOAuthConfig(type), 'snapshot-token-exchange-failed', error);
     }
     await forceReconnectWithOAuthRecovery(uri, type);
     return await getPrimitivesSnapshotWithBackwardsCompatibility(
@@ -1224,6 +1293,7 @@ async function handleMcpMessage(
           try {
             logger.debug('[Background] Starting async reconnection after config update...');
             // Save action is user-initiated; allow one interactive OAuth window if needed.
+            await oauthManager.resetForFreshAuth(config.uri, getEffectiveOAuthConfig(newType));
             oauthManager.allowInteractiveAuth(config.uri, 6);
             await forceReconnectWithOAuthRecovery(config.uri, newType);
             const isConnected = await checkMcpServerConnection();
@@ -1278,6 +1348,7 @@ async function handleMcpMessage(
 
         try {
           // Explicit authorize action from user: allow interactive OAuth.
+          await oauthManager.resetForFreshAuth(getServerUrl(), getEffectiveOAuthConfig(connectionType));
           oauthManager.allowInteractiveAuth(getServerUrl(), 6);
           await forceReconnectWithOAuthRecovery(getServerUrl(), connectionType);
           const status = await oauthManager.getStatus(getServerUrl(), getEffectiveOAuthConfig(connectionType));
